@@ -1,0 +1,17 @@
+{
+  "records": 470,
+  "overfit_46_cases": 20,
+  "overfit_46_split": "splits/m0_overfit_46_20.json",
+  "gt_reconstruction_representative_cases": 10,
+  "gt_reconstruction_representative_list": "splits/m0_gt_reconstruction_representative10.txt",
+  "arch_mismatches": [
+    {
+      "case": "data/05801赵俊Z_46",
+      "tooth_id": "46",
+      "prep_arch": "upper",
+      "expected_arch": "lower",
+      "arch_matches": false,
+      "split": "test"
+    }
+  ]
+}
