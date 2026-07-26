@@ -5,6 +5,7 @@ predictions/
 visualizations/
 diagnostics/
 result/
+templates/
 
 # Python/cache
 __pycache__/

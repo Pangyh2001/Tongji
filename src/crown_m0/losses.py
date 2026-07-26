@@ -52,3 +52,45 @@ def m0_loss(
         )
         loss = loss + normal_weight * normal_loss
     return loss, {"loss": float(loss.detach().cpu()), "chamfer": float(cd.detach().cpu()), "normal": float(normal_loss.detach().cpu())}
+
+
+def edge_length_loss(vertices: torch.Tensor, template_vertices: torch.Tensor, edges: torch.Tensor) -> torch.Tensor:
+    if edges.numel() == 0:
+        return vertices.new_tensor(0.0)
+    pred_len = torch.linalg.norm(vertices[:, edges[:, 0]] - vertices[:, edges[:, 1]], dim=-1)
+    template_len = torch.linalg.norm(template_vertices[edges[:, 0]] - template_vertices[edges[:, 1]], dim=-1)
+    return F.l1_loss(pred_len, template_len.unsqueeze(0).expand_as(pred_len))
+
+
+def laplacian_delta_loss(delta: torch.Tensor, edges: torch.Tensor) -> torch.Tensor:
+    if edges.numel() == 0:
+        return delta.new_tensor(0.0)
+    return torch.mean(torch.linalg.norm(delta[:, edges[:, 0]] - delta[:, edges[:, 1]], dim=-1))
+
+
+def template_deform_loss(
+    pred_vertices: torch.Tensor,
+    target: torch.Tensor,
+    delta: torch.Tensor,
+    template_vertices: torch.Tensor,
+    edges: torch.Tensor,
+    *,
+    chamfer_points: int = 4096,
+    edge_weight: float = 0.05,
+    laplacian_weight: float = 0.10,
+    displacement_weight: float = 0.001,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    target_sample = sample_points(target, chamfer_points)
+    pred_sample = sample_points(pred_vertices, chamfer_points)
+    cd = chamfer_distance(pred_sample[..., :3], target_sample[..., :3])
+    edge = edge_length_loss(pred_vertices, template_vertices, edges)
+    lap = laplacian_delta_loss(delta, edges)
+    disp = torch.mean(delta.square())
+    loss = cd + edge_weight * edge + laplacian_weight * lap + displacement_weight * disp
+    return loss, {
+        "loss": float(loss.detach().cpu()),
+        "chamfer": float(cd.detach().cpu()),
+        "edge": float(edge.detach().cpu()),
+        "laplacian": float(lap.detach().cpu()),
+        "displacement": float(disp.detach().cpu()),
+    }

@@ -665,18 +665,18 @@ python3 scripts/predict_m0.py \
 result/YYYYMMDD/<experiment_name>/
 ```
 
-例如 M0 baseline 正式评估输出为：
+例如 template deformation 版 M0 baseline 正式评估输出为：
 
 ```text
-result/20260726/m0_baseline/
+result/20260726/m0_template/
 ```
 
-正式实验默认只输出 test split，不再额外复制 `representative10/` STL 子集。若后续需要汇报用代表样本，只保存代表样本名单，或直接从 `test/cases/` 中挑选，不再重复生成一份 STL。
+正式实验默认只输出 test split，不再额外复制 `representative10/` STL 子集。若后续需要汇报用代表样本，只保存代表样本名单，或直接从 `test/cases/` 中挑选。
 
 目录结构：
 
 ```text
-result/YYYYMMDD/m0_baseline/
+result/YYYYMMDD/m0_template/
   config.json
   summary_by_sample_set.csv
   test/
@@ -685,10 +685,10 @@ result/YYYYMMDD/m0_baseline/
     summary_metrics.json
     cases/
       <case_id>/
-        <case_id>_pred.npy
-        <case_id>_pred.xyz
-        <case_id>_pred.ply
-        <case_id>_pred_alpha_clean_taubin.stl
+        <case_id>_pred_vertices.npy
+        <case_id>_pred_vertices.xyz
+        <case_id>_pred_vertices.ply
+        <case_id>_pred_template_displacement.stl
         <case_id>_GT_technician.stl
 ```
 
@@ -697,48 +697,55 @@ result/YYYYMMDD/m0_baseline/
 1. `test/metrics_by_case.csv` 必须包含逐病例指标。
 2. `test/summary_metrics.csv/json` 必须包含汇总指标。
 3. 每个样本的 GT STL 和预测 STL 必须放在同一个 `cases/<case_id>/` 文件夹内，便于直接打开对比。
-4. 点云输出模型的正式 STL 方法统一为 `alpha_clean_taubin`。
+4. 后续正式 M0-M3 的 STL 输出统一采用 `template_displacement`。
 5. `result/` 是生成结果目录，默认不提交到 Git。
-
-运行 M0 baseline 正式实验：
-
-```bash
-python3 scripts/run_m0_official_experiment.py \
-  --checkpoint runs/m0_new/best.pt \
-  --date YYYYMMDD \
-  --experiment-name m0_baseline
-```
 
 ### 统一 STL 生成规则
 
-正式实验中，所有以点云作为模型输出的方法必须使用同一套 STL 生成后处理，避免模型差异和 STL 重建差异混在一起。
-
-本项目统一采用：
+后续正式 M0-M3 不再把“无拓扑点云 -> alpha-shape/Poisson -> STL”作为主 STL 输出路线，而统一改为：
 
 ```text
-alpha_clean_taubin
+template crown mesh
+-> 网络预测每个 template vertex 的 displacement
+-> template_vertices + displacement
+-> 沿用 template_faces
+-> 直接导出 STL
 ```
 
-其流程为：
+也就是：
 
 ```text
-预测点云
--> 统计离群点去除
--> 半径离群点去除
--> 0.06 mm voxel down-sample
--> alpha-shape 重建，alpha = 1.2
--> 删除退化/重复三角形、重复顶点和非流形边
--> 保留最大连通分量
--> midpoint subdivision，默认 1 次
--> Taubin smoothing，默认 25 次
--> 计算顶点/三角面法向
--> 输出 STL
+official_stl_method = template_displacement
 ```
 
-注意：这个流程只能改善点云转 STL 的破碎感和三角面观感，不能从根本上修复 M0 点云本身的形态误差。若 M0 输出点云存在噪声、局部外飘、咬合面细节不足、边缘区不稳定或缺少接触约束，STL 仍会出现不自然的坑洼、平面化或临床形态不自然。真正提升到接近技师冠，需要改模型输出表示、训练损失和临床约束，而不是只改 STL 后处理。
+这样所有模型输出 STL 时都共享同一套 mesh topology，faces 不再由 alpha-shape 从散点中猜出来。M0、M1、M2、M3 的区别应体现在输入、网络模块和 loss 上，而不是 STL 重建算法上：
 
-`alpha_raw`、`alpha_clean`、`poisson_raw`、`poisson_clean_taubin`、`bpa_clean` 只用于 STL 后处理消融实验，不用于 M0-M3 正式模型对比。正式比较中，M0、M1、M2、M3 必须使用相同 split、相同评价指标和相同 STL 生成方法。
+```text
+M0: prep + antagonist + tooth/arch -> template displacement
+M1: M0 + margin line input -> template displacement
+M2: M1 + margin-line anchored / ring-wise module -> template displacement
+M3: M2 + margin/risk-weighted loss -> template displacement
+```
 
-如果某个模型未来直接输出 mesh/STL，而不是点云，应在结果表中单独标注其输出表示；不能和点云模型的 `alpha_clean_taubin` 后处理结果混称为同一种 STL 生成流程。
+当前新增的 template deformation baseline 使用：
+
+```bash
+python3 scripts/build_crown_template_mesh.py \
+  --output templates/m0_global_template_4096.npz \
+  --preview-stl templates/m0_global_template_4096.stl
+
+python3 scripts/train_m0_template.py \
+  --template templates/m0_global_template_4096.npz \
+  --output-dir runs/m0_template
+
+python3 scripts/run_m0_template_official_experiment.py \
+  --checkpoint runs/m0_template/best.pt \
+  --template templates/m0_global_template_4096.npz \
+  --date YYYYMMDD \
+  --experiment-name m0_template
+```
+
+旧的 `alpha_clean_taubin` 仍可作为点云 baseline 的兼容导出或 STL 后处理消融，但不作为后续正式 M0-M3 的主 STL 方法。它只能缓解点云转 STL 的破碎感，不能从根本上解决无拓扑点云造成的坑洼、平面化、边缘不闭合和局部形态不稳定。
+
 
 
