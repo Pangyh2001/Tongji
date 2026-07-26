@@ -125,5 +125,11 @@ class M0TemplateDeformNet(nn.Module):
         fused = torch.cat([prep_feat, ant_feat, tooth_feat, arch_feat], dim=1)
         delta = self.decoder(fused).view(prep.shape[0], self.template_vertices, 3)
         delta = torch.tanh(delta) * self.max_displacement_mm
-        vertices = template_vertices.unsqueeze(0) + delta
+        if template_vertices.dim() == 2:
+            base_vertices = template_vertices.unsqueeze(0).expand_as(delta)
+        elif template_vertices.dim() == 3:
+            base_vertices = template_vertices
+        else:
+            raise ValueError(f"template_vertices must be (N, 3) or (B, N, 3), got {tuple(template_vertices.shape)}")
+        vertices = base_vertices + delta
         return vertices, delta

@@ -23,6 +23,7 @@ from src.crown_m0.dataset import CrownDataset, discover_cases
 from src.crown_m0.io import write_ply, write_xyz
 from src.crown_m0.model import M0TemplateDeformNet
 from src.crown_m0.template_mesh import load_template_npz, write_template_mesh_stl
+from src.crown_m0.template_selection import case_feature, load_template_index, select_template
 
 
 OFFICIAL_STL_METHOD = "template_displacement"
@@ -32,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     today = datetime.now().strftime("%Y%m%d")
     parser = argparse.ArgumentParser(description="Run the official M0 template-deformation evaluation.")
     parser.add_argument("--checkpoint", type=Path, default=Path("runs/m0_template/best.pt"))
-    parser.add_argument("--template", type=Path, default=Path("templates/m0_global_template_4096.npz"))
+    parser.add_argument("--template-index", type=Path, default=Path("templates/m0_dynamic_library_4096/template_index.json"))
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--split-file", type=Path, default=Path("splits/m0_patient_split_seed20260706.json"))
     parser.add_argument("--output-root", type=Path, default=Path("result"))
@@ -50,10 +51,10 @@ def main() -> None:
 
     output_dir = args.output_root / args.date / args.experiment_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    template_vertices_np, faces_np = load_template_npz(args.template)
-    template_vertices = torch.from_numpy(template_vertices_np).to(args.device)
-    model = load_model(args, template_vertices_np.shape[0])
-    write_config(output_dir / "config.json", args, template_vertices_np, faces_np)
+    template_entries = load_template_index(args.template_index)
+    first_vertices, _ = load_template_npz(template_entries[0].template)
+    model = load_model(args, first_vertices.shape[0])
+    write_config(output_dir / "config.json", args, first_vertices, template_entries)
 
     records = discover_cases(args.data_dir)
     by_case = {str(record.train_dir.parent): record for record in records}
@@ -65,7 +66,7 @@ def main() -> None:
         print(f"[warn] test: missing {len(missing)} cases", flush=True)
 
     sample_dir = output_dir / "test"
-    rows = run_sample_set(model, selected_records, template_vertices, faces_np, sample_dir, args)
+    rows = run_sample_set(model, selected_records, template_entries, sample_dir, args)
     write_sample_outputs(sample_dir, rows)
     summary = summarize_rows(rows)
     write_csv(output_dir / "summary_by_sample_set.csv", [{"sample_set": "test", **summary[OFFICIAL_STL_METHOD]}])
@@ -84,11 +85,23 @@ def load_model(args: argparse.Namespace, template_vertices: int) -> M0TemplateDe
     return model
 
 
-def run_sample_set(model, records, template_vertices, faces_np, sample_dir: Path, args: argparse.Namespace):
+def run_sample_set(model, records, template_entries, sample_dir: Path, args: argparse.Namespace):
     loader = DataLoader(CrownDataset(records), batch_size=args.batch_size, shuffle=False, num_workers=0)
     rows = []
+    template_cache = {}
     with torch.no_grad():
         for batch in tqdm(loader, desc=sample_dir.name):
+            if len(batch["case_id"]) != 1:
+                raise ValueError("Dynamic template evaluation currently requires --batch-size 1")
+            case_path = Path(batch["case_id"][0])
+            record = next(record for record in records if str(record.train_dir.parent) == str(case_path))
+            entry = select_template(
+                template_entries,
+                tooth_id=record.tooth_id,
+                prep_arch=record.prep_arch,
+                feature=case_feature(case_path),
+            )
+            template_vertices, faces_np = load_eval_template(entry, template_cache, args.device)
             pred_vertices, _ = model(
                 batch["prep"].to(args.device),
                 batch["antagonist"].to(args.device),
@@ -97,12 +110,28 @@ def run_sample_set(model, records, template_vertices, faces_np, sample_dir: Path
                 template_vertices,
             )
             for i, case in enumerate(batch["case_id"]):
-                row = evaluate_case(Path(case), pred_vertices[i].detach().cpu().numpy(), faces_np, sample_dir, args)
+                row = evaluate_case(
+                    Path(case),
+                    pred_vertices[i].detach().cpu().numpy(),
+                    faces_np,
+                    entry,
+                    sample_dir,
+                    args,
+                )
                 rows.append(row)
     return rows
 
 
-def evaluate_case(case_path: Path, pred_local_xyz: np.ndarray, faces_np: np.ndarray, sample_dir: Path, args) -> dict:
+def load_eval_template(entry, cache, device):
+    cached = cache.get(entry.template)
+    if cached is None:
+        vertices_np, faces_np = load_template_npz(entry.template)
+        cached = (torch.from_numpy(vertices_np).to(device), faces_np)
+        cache[entry.template] = cached
+    return cached
+
+
+def evaluate_case(case_path: Path, pred_local_xyz: np.ndarray, faces_np: np.ndarray, entry, sample_dir: Path, args) -> dict:
     stem = safe_case_name(case_path, args.data_dir)
     case_dir = sample_dir / "cases" / stem
     case_dir.mkdir(parents=True, exist_ok=True)
@@ -112,6 +141,7 @@ def evaluate_case(case_path: Path, pred_local_xyz: np.ndarray, faces_np: np.ndar
     pred_xyz = case_dir / f"{stem}_pred_vertices.xyz"
     pred_ply = case_dir / f"{stem}_pred_vertices.ply"
     pred_stl = case_dir / f"{stem}_pred_{OFFICIAL_STL_METHOD}.stl"
+    template_stl_copy = case_dir / f"{stem}_selected_template.stl"
     gt_stl_copy = case_dir / f"{stem}_GT_technician.stl"
 
     try:
@@ -121,6 +151,7 @@ def evaluate_case(case_path: Path, pred_local_xyz: np.ndarray, faces_np: np.ndar
 
         pred_original = restore_original_coordinates(pred_local_xyz, case_path)
         write_template_mesh_stl(pred_stl, pred_original, faces_np)
+        shutil.copy2(entry.preview_stl, template_stl_copy)
 
         gt_stl = find_gt_stl(case_path)
         if gt_stl is None:
@@ -138,7 +169,17 @@ def evaluate_case(case_path: Path, pred_local_xyz: np.ndarray, faces_np: np.ndar
         gt_local = np.load(case_path / "train" / "crown_points.npy").astype(np.float64)[:, :3]
         point_metrics_row = point_metrics(pred_local_xyz, gt_local)
         row.update(prefix_metrics("vertex", point_metrics_row))
-        row.update({"ok": True, "pred_stl": str(pred_stl), "gt_stl": str(gt_stl_copy)})
+        row.update(
+            {
+                "ok": True,
+                "pred_stl": str(pred_stl),
+                "gt_stl": str(gt_stl_copy),
+                "selected_template_stl": str(template_stl_copy),
+                "selected_template_case": entry.source_case,
+                "selected_template_tooth_id": entry.tooth_id,
+                "selected_template_prep_arch": entry.prep_arch,
+            }
+        )
     except Exception as exc:
         row["error"] = f"{type(exc).__name__}: {exc}"
     return row
@@ -225,14 +266,14 @@ def summarize_rows(rows: list[dict]) -> dict[str, dict]:
     return summary
 
 
-def write_config(path: Path, args: argparse.Namespace, vertices: np.ndarray, faces: np.ndarray) -> None:
+def write_config(path: Path, args: argparse.Namespace, vertices: np.ndarray, template_entries) -> None:
     payload = vars(args).copy()
     for key, value in payload.items():
         if isinstance(value, Path):
             payload[key] = str(value)
     payload["official_stl_method"] = OFFICIAL_STL_METHOD
     payload["template_vertices"] = int(vertices.shape[0])
-    payload["template_faces"] = int(faces.shape[0])
+    payload["template_library_size"] = int(len(template_entries))
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 

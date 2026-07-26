@@ -665,10 +665,10 @@ python3 scripts/predict_m0.py \
 result/YYYYMMDD/<experiment_name>/
 ```
 
-例如 template deformation 版 M0 baseline 正式评估输出为：
+例如 dynamic template deformation 版 M0 baseline 正式评估输出为：
 
 ```text
-result/20260726/m0_template/
+result/20260727/m0_template/
 ```
 
 正式实验默认只输出 test split，不再额外复制 `representative10/` STL 子集。若后续需要汇报用代表样本，只保存代表样本名单，或直接从 `test/cases/` 中挑选。
@@ -689,6 +689,7 @@ result/YYYYMMDD/m0_template/
         <case_id>_pred_vertices.xyz
         <case_id>_pred_vertices.ply
         <case_id>_pred_template_displacement.stl
+        <case_id>_selected_template.stl
         <case_id>_GT_technician.stl
 ```
 
@@ -696,19 +697,21 @@ result/YYYYMMDD/m0_template/
 
 1. `test/metrics_by_case.csv` 必须包含逐病例指标。
 2. `test/summary_metrics.csv/json` 必须包含汇总指标。
-3. 每个样本的 GT STL 和预测 STL 必须放在同一个 `cases/<case_id>/` 文件夹内，便于直接打开对比。
+3. 每个样本的 GT STL、预测 STL 和动态检索到的模板 STL 必须放在同一个 `cases/<case_id>/` 文件夹内。
 4. 后续正式 M0-M3 的 STL 输出统一采用 `template_displacement`。
 5. `result/` 是生成结果目录，默认不提交到 Git。
 
 ### 统一 STL 生成规则
 
-后续正式 M0-M3 不再把“无拓扑点云 -> alpha-shape/Poisson -> STL”作为主 STL 输出路线，而统一改为：
+后续正式 M0-M3 不再把“无拓扑点云 -> alpha-shape/Poisson -> STL”作为主 STL 输出路线，而统一改为动态模板变形：
 
 ```text
-template crown mesh
--> 网络预测每个 template vertex 的 displacement
+train split GT STL
+-> 构建动态模板库
+-> 每个 case 按 tooth_id、prep_arch 和 prep 几何特征检索最合适模板
+-> 网络预测该模板每个 vertex 的 displacement
 -> template_vertices + displacement
--> 沿用 template_faces
+-> 沿用 selected_template_faces
 -> 直接导出 STL
 ```
 
@@ -718,34 +721,35 @@ template crown mesh
 official_stl_method = template_displacement
 ```
 
-这样所有模型输出 STL 时都共享同一套 mesh topology，faces 不再由 alpha-shape 从散点中猜出来。M0、M1、M2、M3 的区别应体现在输入、网络模块和 loss 上，而不是 STL 重建算法上：
+这不是“每个模板单独做一次实验”。模板库只提供 case 级初始形态，同一个模型在一次训练中学习不同模板的 displacement。M0、M1、M2、M3 的区别应体现在输入、网络模块和 loss 上，而不是 STL 重建算法上：
 
 ```text
-M0: prep + antagonist + tooth/arch -> template displacement
+M0: dynamic template + prep + antagonist + tooth/arch -> template displacement
 M1: M0 + margin line input -> template displacement
 M2: M1 + margin-line anchored / ring-wise module -> template displacement
 M3: M2 + margin/risk-weighted loss -> template displacement
 ```
 
-当前新增的 template deformation baseline 使用：
+当前新增的 dynamic template deformation baseline 使用：
 
 ```bash
-python3 scripts/build_crown_template_mesh.py \
-  --output templates/m0_global_template_4096.npz \
-  --preview-stl templates/m0_global_template_4096.stl
+python3 scripts/build_crown_template_library.py \
+  --output-dir templates/m0_dynamic_library_4096 \
+  --target-triangles 8192 \
+  --max-templates-per-group 6
 
 python3 scripts/train_m0_template.py \
-  --template templates/m0_global_template_4096.npz \
+  --template-index templates/m0_dynamic_library_4096/template_index.json \
   --output-dir runs/m0_template
 
 python3 scripts/run_m0_template_official_experiment.py \
   --checkpoint runs/m0_template/best.pt \
-  --template templates/m0_global_template_4096.npz \
+  --template-index templates/m0_dynamic_library_4096/template_index.json \
   --date YYYYMMDD \
   --experiment-name m0_template
 ```
 
-旧的 `alpha_clean_taubin` 仍可作为点云 baseline 的兼容导出或 STL 后处理消融，但不作为后续正式 M0-M3 的主 STL 方法。它只能缓解点云转 STL 的破碎感，不能从根本上解决无拓扑点云造成的坑洼、平面化、边缘不闭合和局部形态不稳定。
+旧的 `alpha_clean_taubin` 仍可作为点云 baseline 的兼容导出或 STL 后处理消融，但不作为后续正式 M0-M3 的主 STL 方法。单个全局模板也不作为正式方法，因为一个牙位的模板不能稳定覆盖全部后牙牙位。
 
 
 
