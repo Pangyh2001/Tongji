@@ -25,6 +25,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("templates/m0_dynamic_library_4096"))
     parser.add_argument("--source-split", choices=["train", "val", "test"], default="train")
     parser.add_argument("--target-triangles", type=int, default=8192)
+    parser.add_argument(
+        "--expected-vertices",
+        type=int,
+        default=4098,
+        help="Keep only simplified templates with this vertex count; use 0 to accept the first mesh count.",
+    )
     parser.add_argument("--max-templates-per-group", type=int, default=6)
     return parser.parse_args()
 
@@ -46,7 +52,7 @@ def main() -> None:
     templates_dir = args.output_dir / "cases"
     templates_dir.mkdir(parents=True, exist_ok=True)
     index_rows = []
-    expected_vertices = None
+    expected_vertices = args.expected_vertices if args.expected_vertices > 0 else None
 
     for key, records_in_group in sorted(grouped.items()):
         selected = select_representative_records(records_in_group, args.max_templates_per_group)
