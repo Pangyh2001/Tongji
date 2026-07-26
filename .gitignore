@@ -1,0 +1,17 @@
+# Large data and generated artifacts
+data/
+runs/
+predictions/
+visualizations/
+diagnostics/
+result/
+
+# Python/cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local logs/temp
+*.log
+nohup.out
+*.tmp
