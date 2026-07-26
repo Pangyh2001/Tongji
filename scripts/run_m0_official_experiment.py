@@ -25,7 +25,7 @@ from src.crown_m0.io import write_ply, write_xyz
 from src.crown_m0.model import M0CrownNet
 
 
-OFFICIAL_STL_METHOD = "alpha_clean"
+OFFICIAL_STL_METHOD = "alpha_clean_taubin"
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,8 +37,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--representative-list",
         type=Path,
-        default=Path("splits/m0_stl_representative_10.txt"),
-        help="Optional same-sample-set case list for visual STL comparison.",
+        default=None,
+        help="Optional extra case list for visual STL comparison. Official runs only write test by default.",
     )
     parser.add_argument("--output-root", type=Path, default=Path("result"))
     parser.add_argument("--date", default=today, help="Result date folder, formatted as YYYYMMDD.")
@@ -46,6 +46,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--sample-points", type=int, default=12000)
     parser.add_argument("--alpha", type=float, default=1.2)
+    parser.add_argument("--smooth-iterations", type=int, default=25)
+    parser.add_argument("--subdivide-iterations", type=int, default=1)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -150,7 +152,12 @@ def evaluate_case(
         row.update(prefix_metrics("point", point_metrics(pred_local[:, :3], gt_local[:, :3])))
 
         pred_original = restore_original_coordinates(pred_local, case_path)
-        pred_mesh = reconstruct_alpha_clean(pred_original[:, :3], args.alpha)
+        pred_mesh = reconstruct_alpha_clean(
+            pred_original[:, :3],
+            args.alpha,
+            smooth_iterations=args.smooth_iterations,
+            subdivide_iterations=args.subdivide_iterations,
+        )
         ok = o3d.io.write_triangle_mesh(str(pred_stl), pred_mesh, write_ascii=False)
         if not ok:
             raise RuntimeError(f"failed to write {pred_stl}")
@@ -181,7 +188,13 @@ def evaluate_case(
     return row
 
 
-def reconstruct_alpha_clean(xyz: np.ndarray, alpha: float) -> o3d.geometry.TriangleMesh:
+def reconstruct_alpha_clean(
+    xyz: np.ndarray,
+    alpha: float,
+    *,
+    smooth_iterations: int,
+    subdivide_iterations: int,
+) -> o3d.geometry.TriangleMesh:
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(xyz)
     clean, _ = pcd.remove_statistical_outlier(nb_neighbors=24, std_ratio=2.0)
@@ -202,6 +215,20 @@ def reconstruct_alpha_clean(xyz: np.ndarray, alpha: float) -> o3d.geometry.Trian
             keep_label = int(np.argmax(counts_np))
             mesh.remove_triangles_by_mask(labels_np != keep_label)
             mesh.remove_unreferenced_vertices()
+    if len(mesh.triangles) == 0:
+        raise ValueError("empty alpha_clean mesh")
+    if subdivide_iterations > 0:
+        mesh = mesh.subdivide_midpoint(number_of_iterations=subdivide_iterations)
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_duplicated_vertices()
+        mesh.remove_non_manifold_edges()
+    if smooth_iterations > 0:
+        mesh = mesh.filter_smooth_taubin(
+            number_of_iterations=smooth_iterations,
+            lambda_filter=0.5,
+            mu=-0.53,
+        )
     mesh.compute_vertex_normals()
     mesh.compute_triangle_normals()
     if len(mesh.triangles) == 0:
@@ -298,8 +325,8 @@ def summarize_rows(rows: list[dict]) -> dict[str, dict]:
         "triangles",
         "surface_area",
     ]
-    summary = {"alpha_clean": {"method": "alpha_clean", "n": len(ok_rows)}}
-    item = summary["alpha_clean"]
+    summary = {OFFICIAL_STL_METHOD: {"method": OFFICIAL_STL_METHOD, "n": len(ok_rows)}}
+    item = summary[OFFICIAL_STL_METHOD]
     for key in metric_keys:
         values = np.asarray([float(row[key]) for row in ok_rows if row.get(key) not in ("", None)], dtype=float)
         if values.size:

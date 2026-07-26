@@ -657,25 +657,25 @@ python3 scripts/predict_m0.py \
 
 ### 正式实验结果目录规范
 
-后续所有正式实验结果统一写入 
-esult/，不再写入 
-uns/、predictions/ 或 isualizations/ 作为主结果目录。
+后续所有正式实验结果统一写入 `result/`，不再写入 `runs/`、`predictions/` 或 `visualizations/` 作为主结果目录。
 
 结果目录必须包含实验日期，格式为：
 
-`	ext
+```text
 result/YYYYMMDD/<experiment_name>/
-`
+```
 
 例如 M0 baseline 正式评估输出为：
 
-`	ext
+```text
 result/20260726/m0_baseline/
-`
+```
 
-每个实验目录下按样本集继续分层，例如：
+正式实验默认只输出 test split，不再额外复制 `representative10/` STL 子集。若后续需要汇报用代表样本，只保存代表样本名单，或直接从 `test/cases/` 中挑选，不再重复生成一份 STL。
 
-`	ext
+目录结构：
+
+```text
 result/YYYYMMDD/m0_baseline/
   config.json
   summary_by_sample_set.csv
@@ -688,33 +688,26 @@ result/YYYYMMDD/m0_baseline/
         <case_id>_pred.npy
         <case_id>_pred.xyz
         <case_id>_pred.ply
-        <case_id>_pred_alpha_clean.stl
+        <case_id>_pred_alpha_clean_taubin.stl
         <case_id>_GT_technician.stl
-  representative10/
-    metrics_by_case.csv
-    summary_metrics.csv
-    summary_metrics.json
-    cases/
-      <case_id>/
-        <case_id>_pred_alpha_clean.stl
-        <case_id>_GT_technician.stl
-`
+```
 
 要求：
 
-1. 每个样本集必须有逐病例指标 metrics_by_case.csv。
-2. 每个样本集必须有汇总指标 summary_metrics.csv/json。
-3. 每个样本的 GT STL 和预测 STL 必须放在同一个 cases/<case_id>/ 文件夹内，便于直接打开对比。
-4. 点云输出模型的正式 STL 方法统一为 lpha_clean。
-5. lpha_raw、poisson_clean_taubin、pa_clean 等只作为 STL 后处理消融，不进入正式 M0-M3 主比较。
-6. 
-esult/ 是生成结果目录，默认不提交到 Git。
+1. `test/metrics_by_case.csv` 必须包含逐病例指标。
+2. `test/summary_metrics.csv/json` 必须包含汇总指标。
+3. 每个样本的 GT STL 和预测 STL 必须放在同一个 `cases/<case_id>/` 文件夹内，便于直接打开对比。
+4. 点云输出模型的正式 STL 方法统一为 `alpha_clean_taubin`。
+5. `result/` 是生成结果目录，默认不提交到 Git。
 
 运行 M0 baseline 正式实验：
 
-`ash
-python3 scripts/run_m0_official_experiment.py   --checkpoint runs/m0_new/best.pt   --date YYYYMMDD   --experiment-name m0_baseline
-`
+```bash
+python3 scripts/run_m0_official_experiment.py \
+  --checkpoint runs/m0_new/best.pt \
+  --date YYYYMMDD \
+  --experiment-name m0_baseline
+```
 
 ### 统一 STL 生成规则
 
@@ -723,7 +716,7 @@ python3 scripts/run_m0_official_experiment.py   --checkpoint runs/m0_new/best.pt
 本项目统一采用：
 
 ```text
-alpha_clean
+alpha_clean_taubin
 ```
 
 其流程为：
@@ -734,29 +727,18 @@ alpha_clean
 -> 半径离群点去除
 -> 0.06 mm voxel down-sample
 -> alpha-shape 重建，alpha = 1.2
--> 删除退化/重复三角形和非流形边
+-> 删除退化/重复三角形、重复顶点和非流形边
 -> 保留最大连通分量
+-> midpoint subdivision，默认 1 次
+-> Taubin smoothing，默认 25 次
 -> 计算顶点/三角面法向
 -> 输出 STL
 ```
 
-正式主实验应统一调用：
+注意：这个流程只能改善点云转 STL 的破碎感和三角面观感，不能从根本上修复 M0 点云本身的形态误差。若 M0 输出点云存在噪声、局部外飘、咬合面细节不足、边缘区不稳定或缺少接触约束，STL 仍会出现不自然的坑洼、平面化或临床形态不自然。真正提升到接近技师冠，需要改模型输出表示、训练损失和临床约束，而不是只改 STL 后处理。
 
-```bash
-python3 scripts/run_stl_reconstruction_experiments.py \
-  --methods alpha_clean \
-  --prediction-dir predictions/<experiment_name> \
-  --output-dir visualizations/<experiment_name>_stl
-```
+`alpha_raw`、`alpha_clean`、`poisson_raw`、`poisson_clean_taubin`、`bpa_clean` 只用于 STL 后处理消融实验，不用于 M0-M3 正式模型对比。正式比较中，M0、M1、M2、M3 必须使用相同 split、相同评价指标和相同 STL 生成方法。
 
-`scripts/run_stl_reconstruction_experiments.py` 的默认方法已经设置为 `alpha_clean`。如果不显式传入 `--methods`，也会使用该统一流程。
+如果某个模型未来直接输出 mesh/STL，而不是点云，应在结果表中单独标注其输出表示；不能和点云模型的 `alpha_clean_taubin` 后处理结果混称为同一种 STL 生成流程。
 
-`alpha_raw`、`poisson_raw`、`poisson_clean_taubin`、`bpa_clean` 只用于 STL 后处理消融实验，不用于 M0-M3 正式模型对比。正式比较中，M0、M1、M2、M3 必须使用相同 split、相同评价指标和相同 STL 生成方法。
 
-如果某个模型未来直接输出 mesh/STL，而不是点云，应在结果表中单独标注其输出表示；不能和点云模型的 alpha_clean 后处理结果混称为同一种 STL 生成流程。
-
-## 总结
-
-本方案基于真实后牙 CAD/CAM 配对病例，以患者上下颌模型、技师最终设计冠和 margin line 为核心数据基础。模型层面引入边缘线锚定的 ring-wise 生成机制，评价层面建立 R1-R5 临床风险分区和 CRCS 临床风险加权评分，并通过接触图、专家盲评和小样本实体冠验证连接真实 CAD/CAM 工作流。
-
-核心贡献不是简单追求整体几何相似，而是将 AI 牙冠生成结果转化为可分区量化、可解释、能提示人工修改重点的临床质量评价体系。

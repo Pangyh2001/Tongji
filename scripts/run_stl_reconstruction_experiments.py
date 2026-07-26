@@ -14,15 +14,15 @@ from scipy.spatial import cKDTree
 
 o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
 
-METHODS = ("alpha_raw", "alpha_clean", "poisson_raw", "poisson_clean_taubin", "bpa_clean")
-OFFICIAL_STL_METHOD = "alpha_clean"
+METHODS = ("alpha_raw", "alpha_clean", "alpha_clean_taubin", "poisson_raw", "poisson_clean_taubin", "bpa_clean")
+OFFICIAL_STL_METHOD = "alpha_clean_taubin"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Reconstruct crown point clouds as STL meshes. The official experiment "
-            "default is alpha_clean; pass --methods explicitly only for STL-method ablations."
+            "default is alpha_clean_taubin; pass --methods explicitly only for STL-method ablations."
         )
     )
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         choices=METHODS,
         default=[OFFICIAL_STL_METHOD],
-        help="STL reconstruction methods. Default is the official unified pipeline: alpha_clean.",
+        help="STL reconstruction methods. Default is the official unified pipeline: alpha_clean_taubin.",
     )
     parser.add_argument("--max-cases", type=int, default=0)
     parser.add_argument("--sample-points", type=int, default=12000)
@@ -144,6 +144,15 @@ def reconstruct(pred_arr: np.ndarray, method: str, args: argparse.Namespace) -> 
     if method == "alpha_clean":
         clean = clean_point_cloud(pcd)
         return o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(clean, args.alpha)
+
+    if method == "alpha_clean_taubin":
+        clean = clean_point_cloud(pcd)
+        mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(clean, args.alpha)
+        mesh = cleanup_mesh(mesh, keep_largest=True)
+        mesh = mesh.subdivide_midpoint(number_of_iterations=1)
+        mesh = cleanup_mesh(mesh, keep_largest=True)
+        mesh = mesh.filter_smooth_taubin(number_of_iterations=25, lambda_filter=0.5, mu=-0.53)
+        return mesh
 
     if method == "poisson_raw":
         p = prepare_normals(pcd, args)
