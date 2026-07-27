@@ -532,18 +532,22 @@ M0 的定义：
 
 - 输入：`prep_points.npy`、`antagonist_points.npy`、牙位编码、预备体颌位编码。
 - 不输入：`margin_points.npy`。
-- 输出：`16384 x 6` 的 AI 冠外表面点云，包含坐标和法向量。
-- 损失：采样 Chamfer Distance + 可选 normal cosine loss。
+- 输出：coarse-to-fine 解码器逐级生成 `8192 -> 32768 -> 65536` 点的 AI 冠外表面点云，每点包含坐标和法向量。
+- 损失：三级 Chamfer/normal 监督 + sibling repulsion + point uniformity + offset regularization。
 
-M0 当前采用 PointNet 风格上下文编码器作为可复现 baseline：
+M0 保留原始 direct MLP decoder 作为历史消融；正式高密度点云实验采用共享参数的 coarse-to-fine decoder：
 
 ```text
 prep ROI point cloud -> PointNet encoder
 antagonist ROI point cloud -> PointNet encoder
 tooth_id -> embedding
 prep_arch -> embedding
-fused feature -> MLP decoder -> 16384 crown points
+fused feature -> learned coarse seeds -> 8192 coarse points
+8192 parent points -> 4 learned local offsets per parent -> 32768 points
+32768 parent points -> 2 learned local offsets per parent -> 65536 points
 ```
+
+上采样点是模型根据病例上下文学习的局部偏移，不是对 16384 点预测结果做随机插值。局部展开层在所有父点之间共享参数，避免 direct 64k MLP 中大量独立输出点缺少局部结构约束。
 
 ### 安装依赖
 
@@ -620,23 +624,27 @@ test:   70 cases
 python3 scripts/train_m0.py \
   --data-dir data \
   --split-file splits/m0_patient_split_seed20260706.json \
-  --output-dir runs/m0 \
-  --epochs 100 \
-  --batch-size 2 \
+  --output-dir runs/m0_coarse_to_fine64k \
+  --decoder coarse_to_fine \
+  --coarse-points 8192 \
+  --first-factor 4 \
+  --second-factor 2 \
+  --epochs 60 \
+  --batch-size 8 \
   --chamfer-points 2048
 ```
 
-训练脚本会按患者 ID 划分 train/val/test，避免同一患者多颗牙位跨集合泄漏。划分结果保存到：
+固定 split 已显式传入，训练脚本不会重新随机划分。划分结果保存到：
 
 ```text
-runs/m0/split.json
+runs/m0_coarse_to_fine64k/split.json
 ```
 
 checkpoint 保存到：
 
 ```text
-runs/m0/latest.pt
-runs/m0/best.pt
+runs/m0_coarse_to_fine64k/latest.pt
+runs/m0_coarse_to_fine64k/best.pt
 ```
 
 ### 推理导出
@@ -665,10 +673,10 @@ python3 scripts/predict_m0.py \
 result/YYYYMMDD/<experiment_name>/
 ```
 
-例如 dynamic template deformation 版 M0 baseline 正式评估输出为：
+例如 coarse-to-fine 64k 点云版 M0 正式评估输出为：
 
 ```text
-result/20260727/m0_template/
+result/20260727/m0_coarse_to_fine64k/
 ```
 
 正式实验默认只输出 test split，不再额外复制 `representative10/` STL 子集。若后续需要汇报用代表样本，只保存代表样本名单，或直接从 `test/cases/` 中挑选。
@@ -676,7 +684,7 @@ result/20260727/m0_template/
 目录结构：
 
 ```text
-result/YYYYMMDD/m0_template/
+result/YYYYMMDD/m0_coarse_to_fine64k/
   config.json
   summary_by_sample_set.csv
   test/
@@ -685,11 +693,10 @@ result/YYYYMMDD/m0_template/
     summary_metrics.json
     cases/
       <case_id>/
-        <case_id>_pred_vertices.npy
-        <case_id>_pred_vertices.xyz
-        <case_id>_pred_vertices.ply
-        <case_id>_pred_template_displacement.stl
-        <case_id>_selected_template.stl
+        <case_id>_pred.npy
+        <case_id>_pred.xyz
+        <case_id>_pred.ply
+        <case_id>_pred_alpha_clean_taubin.stl
         <case_id>_GT_technician.stl
 ```
 
@@ -697,59 +704,53 @@ result/YYYYMMDD/m0_template/
 
 1. `test/metrics_by_case.csv` 必须包含逐病例指标。
 2. `test/summary_metrics.csv/json` 必须包含汇总指标。
-3. 每个样本的 GT STL、预测 STL 和动态检索到的模板 STL 必须放在同一个 `cases/<case_id>/` 文件夹内。
-4. 后续正式 M0-M3 的 STL 输出统一采用 `template_displacement`。
+3. 每个样本的 GT STL、预测点云和预测 STL 必须放在同一个 `cases/<case_id>/` 文件夹内。
+4. 后续点云版 M0-M3 统一使用相同的 coarse-to-fine 输出密度和 STL 重建参数。
 5. `result/` 是生成结果目录，默认不提交到 Git。
 
 ### 统一 STL 生成规则
 
-后续正式 M0-M3 不再把“无拓扑点云 -> alpha-shape/Poisson -> STL”作为主 STL 输出路线，而统一改为动态模板变形：
+后续正式点云版 M0-M3 统一采用高密度预测点云和固定的清理/重建流程：
 
 ```text
-train split GT STL
--> 构建动态模板库
--> 每个 case 按 tooth_id、prep_arch 和 prep 几何特征检索最合适模板
--> 网络预测该模板每个 vertex 的 displacement
--> template_vertices + displacement
--> 沿用 selected_template_faces
--> 直接导出 STL
+model predicts 65536 structured points
+-> statistical outlier removal
+-> radius outlier removal
+-> 0.06 mm voxel duplicate reduction
+-> alpha-shape reconstruction
+-> keep largest connected component
+-> midpoint subdivision
+-> Taubin smoothing
+-> export STL
 ```
 
 也就是：
 
 ```text
-official_stl_method = template_displacement
+official_stl_method = alpha_clean_taubin
 ```
 
-这不是“每个模板单独做一次实验”。模板库只提供 case 级初始形态，同一个模型在一次训练中学习不同模板的 displacement。M0、M1、M2、M3 的区别应体现在输入、网络模块和 loss 上，而不是 STL 重建算法上：
+M0-M3 的实验差别仍只体现在输入、网络模块和 loss，STL 参数保持一致：
 
 ```text
-M0: dynamic template + prep + antagonist + tooth/arch -> template displacement
-M1: M0 + margin line input -> template displacement
-M2: M1 + margin-line anchored / ring-wise module -> template displacement
-M3: M2 + margin/risk-weighted loss -> template displacement
+M0: prep + antagonist + tooth/arch -> coarse-to-fine 64k points
+M1: M0 + margin line input -> coarse-to-fine 64k points
+M2: M1 + margin-line anchored / ring-wise module -> coarse-to-fine 64k points
+M3: M2 + margin/risk-weighted loss -> coarse-to-fine 64k points
 ```
 
-当前新增的 dynamic template deformation baseline 使用：
+正式 M0 评估命令：
 
 ```bash
-python3 scripts/build_crown_template_library.py \
-  --output-dir templates/m0_dynamic_library_4096 \
-  --target-triangles 8192 \
-  --max-templates-per-group 6
-
-python3 scripts/train_m0_template.py \
-  --template-index templates/m0_dynamic_library_4096/template_index.json \
-  --output-dir runs/m0_template
-
-python3 scripts/run_m0_template_official_experiment.py \
-  --checkpoint runs/m0_template/best.pt \
-  --template-index templates/m0_dynamic_library_4096/template_index.json \
+python3 scripts/run_m0_official_experiment.py \
+  --checkpoint runs/m0_coarse_to_fine64k/best.pt \
   --date YYYYMMDD \
-  --experiment-name m0_template
+  --experiment-name m0_coarse_to_fine64k \
+  --alpha 1.0 \
+  --smooth-iterations 25 \
+  --subdivide-iterations 1
 ```
 
-旧的 `alpha_clean_taubin` 仍可作为点云 baseline 的兼容导出或 STL 后处理消融，但不作为后续正式 M0-M3 的主 STL 方法。单个全局模板也不作为正式方法，因为一个牙位的模板不能稳定覆盖全部后牙牙位。
-
+旧的 direct 16k/32k/64k MLP 和 dynamic template deformation 结果保留为方法消融，不作为当前正式 M0 输出。增加输出点数必须由模型的共享局部展开层学习，禁止把低密度预测点云机械插值后冒充高密度模型输出。
 
 

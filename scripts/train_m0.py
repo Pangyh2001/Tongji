@@ -14,8 +14,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.crown_m0.dataset import CrownDataset, discover_cases, split_by_patient
-from src.crown_m0.losses import m0_loss
-from src.crown_m0.model import M0CrownNet
+from src.crown_m0.losses import coarse_to_fine_loss, m0_loss
+from src.crown_m0.model import M0CoarseToFineNet, M0CrownNet
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,6 +34,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chamfer-points", type=int, default=2048)
     parser.add_argument("--normal-weight", type=float, default=0.05)
     parser.add_argument("--output-points", type=int, default=16384)
+    parser.add_argument("--decoder", choices=["direct", "coarse_to_fine"], default="direct")
+    parser.add_argument("--coarse-points", type=int, default=8192)
+    parser.add_argument("--first-factor", type=int, default=4)
+    parser.add_argument("--second-factor", type=int, default=2)
+    parser.add_argument("--repulsion-weight", type=float, default=0.10)
+    parser.add_argument("--uniformity-weight", type=float, default=0.01)
+    parser.add_argument("--offset-weight", type=float, default=0.001)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -74,7 +81,7 @@ def main() -> None:
         pin_memory=args.device.startswith("cuda"),
     )
 
-    model = M0CrownNet(output_points=args.output_points).to(args.device)
+    model = build_model(args).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     best_val = float("inf")
 
@@ -97,15 +104,37 @@ def main() -> None:
             torch.save(latest, args.output_dir / "best.pt")
 
 
+def build_model(args: argparse.Namespace) -> torch.nn.Module:
+    if args.decoder == "coarse_to_fine":
+        return M0CoarseToFineNet(
+            coarse_points=args.coarse_points,
+            first_factor=args.first_factor,
+            second_factor=args.second_factor,
+        )
+    return M0CrownNet(output_points=args.output_points)
+
+
 def run_epoch(
-    model: M0CrownNet,
+    model: torch.nn.Module,
     loader: DataLoader,
     args: argparse.Namespace,
     optimizer: torch.optim.Optimizer | None,
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
-    sums = {"loss": 0.0, "chamfer": 0.0, "normal": 0.0}
+    if args.decoder == "coarse_to_fine":
+        sums = {
+            "loss": 0.0,
+            "coarse_chamfer": 0.0,
+            "middle_chamfer": 0.0,
+            "fine_chamfer": 0.0,
+            "fine_normal": 0.0,
+            "repulsion": 0.0,
+            "uniformity": 0.0,
+            "offset": 0.0,
+        }
+    else:
+        sums = {"loss": 0.0, "chamfer": 0.0, "normal": 0.0}
     count = 0
 
     for batch in tqdm(loader, desc="train" if training else "val", leave=False):
@@ -116,13 +145,32 @@ def run_epoch(
         prep_arch_index = batch["prep_arch_index"].to(args.device, non_blocking=True)
 
         with torch.set_grad_enabled(training):
-            pred = model(prep, antagonist, tooth_index, prep_arch_index)
-            loss, metrics = m0_loss(
-                pred,
-                crown,
-                chamfer_points=args.chamfer_points,
-                normal_weight=args.normal_weight,
-            )
+            if args.decoder == "coarse_to_fine":
+                outputs = model(
+                    prep,
+                    antagonist,
+                    tooth_index,
+                    prep_arch_index,
+                    return_stages=True,
+                )
+                loss, metrics = coarse_to_fine_loss(
+                    outputs["stages"],
+                    outputs["offsets"],
+                    crown,
+                    chamfer_points=args.chamfer_points,
+                    normal_weight=args.normal_weight,
+                    repulsion_weight=args.repulsion_weight,
+                    uniformity_weight=args.uniformity_weight,
+                    offset_weight=args.offset_weight,
+                )
+            else:
+                pred = model(prep, antagonist, tooth_index, prep_arch_index)
+                loss, metrics = m0_loss(
+                    pred,
+                    crown,
+                    chamfer_points=args.chamfer_points,
+                    normal_weight=args.normal_weight,
+                )
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()

@@ -74,6 +74,147 @@ class M0CrownNet(nn.Module):
         return out.view(prep.shape[0], self.output_points, self.output_channels)
 
 
+class PointUpsampleBlock(nn.Module):
+    """Learn child points as bounded local offsets from each parent point."""
+
+    def __init__(
+        self,
+        *,
+        factor: int,
+        context_dim: int,
+        hidden_dim: int = 192,
+        max_offset_mm: float,
+    ) -> None:
+        super().__init__()
+        self.factor = factor
+        self.max_offset_mm = max_offset_mm
+        self.point_projection = nn.Linear(6, hidden_dim)
+        self.context_projection = nn.Linear(context_dim, hidden_dim)
+        self.child_codes = nn.Parameter(torch.randn(factor, hidden_dim) * 0.02)
+        self.refine = nn.Sequential(
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.offset_head = nn.Linear(hidden_dim, 3)
+        self.normal_head = nn.Linear(hidden_dim, 3)
+
+    def forward(
+        self,
+        parents: torch.Tensor,
+        context: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        features = (
+            self.point_projection(parents).unsqueeze(2)
+            + self.context_projection(context)[:, None, None, :]
+            + self.child_codes[None, None, :, :]
+        )
+        features = self.refine(features)
+        offsets = torch.tanh(self.offset_head(features)) * self.max_offset_mm
+
+        parent_xyz = parents[..., :3].unsqueeze(2)
+        parent_normals = parents[..., 3:6].unsqueeze(2)
+        xyz = parent_xyz + offsets
+        normal_delta = 0.25 * torch.tanh(self.normal_head(features))
+        normals = torch.nn.functional.normalize(parent_normals + normal_delta, dim=-1, eps=1e-6)
+        children = torch.cat([xyz, normals], dim=-1)
+        return children.flatten(1, 2), offsets
+
+
+class M0CoarseToFineNet(nn.Module):
+    """Generate a structured crown point cloud in 8k -> 32k -> 64k stages."""
+
+    def __init__(
+        self,
+        *,
+        coarse_points: int = 8192,
+        first_factor: int = 4,
+        second_factor: int = 2,
+        feature_dim: int = 512,
+        latent_dim: int = 768,
+        seed_dim: int = 64,
+        tooth_count: int = 16,
+        arch_count: int = 3,
+        first_max_offset_mm: float = 0.35,
+        second_max_offset_mm: float = 0.16,
+    ) -> None:
+        super().__init__()
+        self.coarse_points = coarse_points
+        self.first_factor = first_factor
+        self.second_factor = second_factor
+        self.output_points = coarse_points * first_factor * second_factor
+        self.output_channels = 6
+
+        self.prep_encoder = PointNetEncoder(6, feature_dim)
+        self.antagonist_encoder = PointNetEncoder(6, feature_dim)
+        self.tooth_embedding = nn.Embedding(tooth_count, 64)
+        self.arch_embedding = nn.Embedding(arch_count, 16)
+
+        fused_dim = feature_dim * 2 + 64 + 16
+        self.context_decoder = nn.Sequential(
+            nn.Linear(fused_dim, latent_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(latent_dim, latent_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.coarse_seeds = nn.Embedding(coarse_points, seed_dim)
+        self.coarse_seed_projection = nn.Linear(seed_dim, 256)
+        self.coarse_context_projection = nn.Linear(latent_dim, 256)
+        self.coarse_decoder = nn.Sequential(
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 6),
+        )
+        self.upsample_32k = PointUpsampleBlock(
+            factor=first_factor,
+            context_dim=latent_dim,
+            max_offset_mm=first_max_offset_mm,
+        )
+        self.upsample_64k = PointUpsampleBlock(
+            factor=second_factor,
+            context_dim=latent_dim,
+            max_offset_mm=second_max_offset_mm,
+        )
+
+    def forward(
+        self,
+        prep: torch.Tensor,
+        antagonist: torch.Tensor,
+        tooth_index: torch.Tensor,
+        prep_arch_index: torch.Tensor,
+        *,
+        return_stages: bool = False,
+    ) -> torch.Tensor | dict[str, torch.Tensor | list[torch.Tensor]]:
+        prep_feat = self.prep_encoder(prep)
+        ant_feat = self.antagonist_encoder(antagonist)
+        tooth_feat = self.tooth_embedding(tooth_index)
+        arch_feat = self.arch_embedding(prep_arch_index)
+        context = self.context_decoder(torch.cat([prep_feat, ant_feat, tooth_feat, arch_feat], dim=1))
+
+        seed_features = self.coarse_seed_projection(self.coarse_seeds.weight)[None, :, :]
+        coarse_features = seed_features + self.coarse_context_projection(context)[:, None, :]
+        coarse_raw = self.coarse_decoder(coarse_features)
+        coarse = torch.cat(
+            [
+                coarse_raw[..., :3],
+                torch.nn.functional.normalize(coarse_raw[..., 3:6], dim=-1, eps=1e-6),
+            ],
+            dim=-1,
+        )
+        middle, offsets_32k = self.upsample_32k(coarse, context)
+        fine, offsets_64k = self.upsample_64k(middle, context)
+        if return_stages:
+            return {
+                "stages": [coarse, middle, fine],
+                "offsets": [offsets_32k, offsets_64k],
+            }
+        return fine
+
+
 class M0TemplateDeformNet(nn.Module):
     """M0 template-deformation baseline.
 

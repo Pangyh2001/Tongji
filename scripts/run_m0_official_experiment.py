@@ -22,7 +22,7 @@ if str(ROOT) not in sys.path:
 
 from src.crown_m0.dataset import CrownDataset, discover_cases
 from src.crown_m0.io import write_ply, write_xyz
-from src.crown_m0.model import M0CrownNet
+from src.crown_m0.model import M0CoarseToFineNet, M0CrownNet
 
 
 OFFICIAL_STL_METHOD = "alpha_clean_taubin"
@@ -82,10 +82,17 @@ def main() -> None:
     print(f"wrote {output_dir}", flush=True)
 
 
-def load_model(args: argparse.Namespace) -> M0CrownNet:
+def load_model(args: argparse.Namespace) -> torch.nn.Module:
     checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
     checkpoint_args = checkpoint.get("args", {})
-    model = M0CrownNet(output_points=int(checkpoint_args.get("output_points", 16384))).to(args.device)
+    if checkpoint_args.get("decoder") == "coarse_to_fine":
+        model = M0CoarseToFineNet(
+            coarse_points=int(checkpoint_args.get("coarse_points", 8192)),
+            first_factor=int(checkpoint_args.get("first_factor", 4)),
+            second_factor=int(checkpoint_args.get("second_factor", 2)),
+        ).to(args.device)
+    else:
+        model = M0CrownNet(output_points=int(checkpoint_args.get("output_points", 16384))).to(args.device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     return model
