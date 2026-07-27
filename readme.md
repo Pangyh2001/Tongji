@@ -532,8 +532,8 @@ M0 的定义：
 
 - 输入：`prep_points.npy`、`antagonist_points.npy`、牙位编码、预备体颌位编码。
 - 不输入：`margin_points.npy`。
-- 输出：coarse-to-fine 解码器逐级生成 `8192 -> 32768 -> 65536` 点的 AI 冠外表面点云，每点包含坐标和法向量。
-- 损失：三级 Chamfer/normal 监督 + sibling repulsion + point uniformity + offset regularization。
+- 输出：tangent coarse-to-fine 解码器逐级生成 `8192 -> 32768 -> 65536` 点的 AI 冠外表面点云，每点包含坐标和法向量。
+- 损失：三级 Chamfer/normal/point-to-plane 监督 + tangent sibling repulsion + point uniformity + local-plane consistency + normal-drift regularization。
 
 M0 保留原始 direct MLP decoder 作为历史消融；正式高密度点云实验采用共享参数的 coarse-to-fine decoder：
 
@@ -543,11 +543,11 @@ antagonist ROI point cloud -> PointNet encoder
 tooth_id -> embedding
 prep_arch -> embedding
 fused feature -> learned coarse seeds -> 8192 coarse points
-8192 parent points -> 4 learned local offsets per parent -> 32768 points
-32768 parent points -> 2 learned local offsets per parent -> 65536 points
+8192 parent points -> 4 tangent-plane offsets per parent -> 32768 points
+32768 parent points -> 2 tangent-plane offsets per parent -> 65536 points
 ```
 
-上采样点是模型根据病例上下文学习的局部偏移，不是对 16384 点预测结果做随机插值。局部展开层在所有父点之间共享参数，避免 direct 64k MLP 中大量独立输出点缺少局部结构约束。
+上采样点是模型根据病例上下文学习的局部偏移，不是对 16384 点预测结果做随机插值。每个子点主要沿父点的局部切平面展开，第一层/第二层法向偏移分别限制在 `0.02 mm`/`0.01 mm`，避免高密度点云形成有厚度的点层并在 STL 中产生尖刺。
 
 ### 安装依赖
 
@@ -624,27 +624,31 @@ test:   70 cases
 python3 scripts/train_m0.py \
   --data-dir data \
   --split-file splits/m0_patient_split_seed20260706.json \
-  --output-dir runs/m0_coarse_to_fine64k \
-  --decoder coarse_to_fine \
+  --output-dir runs/m0_tangent_c2f64k \
+  --decoder coarse_to_fine_tangent \
   --coarse-points 8192 \
   --first-factor 4 \
   --second-factor 2 \
   --epochs 60 \
-  --batch-size 8 \
-  --chamfer-points 2048
+  --batch-size 4 \
+  --chamfer-points 8192 \
+  --normal-weight 0.20 \
+  --point-to-plane-weight 0.50 \
+  --local-plane-weight 0.20 \
+  --normal-drift-weight 0.50
 ```
 
 固定 split 已显式传入，训练脚本不会重新随机划分。划分结果保存到：
 
 ```text
-runs/m0_coarse_to_fine64k/split.json
+runs/m0_tangent_c2f64k/split.json
 ```
 
 checkpoint 保存到：
 
 ```text
-runs/m0_coarse_to_fine64k/latest.pt
-runs/m0_coarse_to_fine64k/best.pt
+runs/m0_tangent_c2f64k/latest.pt
+runs/m0_tangent_c2f64k/best.pt
 ```
 
 ### 推理导出
@@ -676,7 +680,7 @@ result/YYYYMMDD/<experiment_name>/
 例如 coarse-to-fine 64k 点云版 M0 正式评估输出为：
 
 ```text
-result/20260727/m0_coarse_to_fine64k/
+result/20260727/m0_tangent_c2f64k/
 ```
 
 正式实验默认只输出 test split，不再额外复制 `representative10/` STL 子集。若后续需要汇报用代表样本，只保存代表样本名单，或直接从 `test/cases/` 中挑选。
@@ -684,7 +688,7 @@ result/20260727/m0_coarse_to_fine64k/
 目录结构：
 
 ```text
-result/YYYYMMDD/m0_coarse_to_fine64k/
+result/YYYYMMDD/m0_tangent_c2f64k/
   config.json
   summary_by_sample_set.csv
   test/
@@ -696,7 +700,7 @@ result/YYYYMMDD/m0_coarse_to_fine64k/
         <case_id>_pred.npy
         <case_id>_pred.xyz
         <case_id>_pred.ply
-        <case_id>_pred_alpha_clean_taubin.stl
+        <case_id>_pred_tangent_mls_poisson.stl
         <case_id>_GT_technician.stl
 ```
 
@@ -713,13 +717,14 @@ result/YYYYMMDD/m0_coarse_to_fine64k/
 后续正式点云版 M0-M3 统一采用高密度预测点云和固定的清理/重建流程：
 
 ```text
-model predicts 65536 structured points
+model predicts 65536 tangent-constrained points
 -> statistical outlier removal
--> radius outlier removal
--> 0.06 mm voxel duplicate reduction
--> alpha-shape reconstruction
+-> 0.08 mm voxel consolidation
+-> normal-guided MLS projection
+-> Screened Poisson reconstruction
+-> remove low-density vertices
 -> keep largest connected component
--> midpoint subdivision
+-> simplify to at most 50000 triangles
 -> Taubin smoothing
 -> export STL
 ```
@@ -727,30 +732,31 @@ model predicts 65536 structured points
 也就是：
 
 ```text
-official_stl_method = alpha_clean_taubin
+official_stl_method = tangent_mls_poisson
 ```
 
 M0-M3 的实验差别仍只体现在输入、网络模块和 loss，STL 参数保持一致：
 
 ```text
-M0: prep + antagonist + tooth/arch -> coarse-to-fine 64k points
-M1: M0 + margin line input -> coarse-to-fine 64k points
-M2: M1 + margin-line anchored / ring-wise module -> coarse-to-fine 64k points
-M3: M2 + margin/risk-weighted loss -> coarse-to-fine 64k points
+M0: prep + antagonist + tooth/arch -> tangent coarse-to-fine 64k points
+M1: M0 + margin line input -> tangent coarse-to-fine 64k points
+M2: M1 + margin-line anchored / ring-wise module -> tangent coarse-to-fine 64k points
+M3: M2 + margin/risk-weighted loss -> tangent coarse-to-fine 64k points
 ```
 
 正式 M0 评估命令：
 
 ```bash
 python3 scripts/run_m0_official_experiment.py \
-  --checkpoint runs/m0_coarse_to_fine64k/best.pt \
+  --checkpoint runs/m0_tangent_c2f64k/best.pt \
   --date YYYYMMDD \
-  --experiment-name m0_coarse_to_fine64k \
-  --alpha 1.0 \
-  --smooth-iterations 25 \
-  --subdivide-iterations 1
+  --experiment-name m0_tangent_c2f64k \
+  --stl-method tangent_mls_poisson \
+  --poisson-depth 8 \
+  --poisson-threads 8 \
+  --mls-iterations 2 \
+  --smooth-iterations 10
 ```
 
-旧的 direct 16k/32k/64k MLP 和 dynamic template deformation 结果保留为方法消融，不作为当前正式 M0 输出。增加输出点数必须由模型的共享局部展开层学习，禁止把低密度预测点云机械插值后冒充高密度模型输出。
-
+旧的 direct 16k/32k/64k MLP、无切平面约束 coarse-to-fine、dynamic template deformation 和 `alpha_clean_taubin` 结果保留为方法消融，不作为当前正式 M0 输出。增加输出点数必须由模型的切平面局部展开层学习，禁止把低密度预测点云机械插值后冒充高密度模型输出。
 

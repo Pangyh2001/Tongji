@@ -14,8 +14,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.crown_m0.dataset import CrownDataset, discover_cases, split_by_patient
-from src.crown_m0.losses import coarse_to_fine_loss, m0_loss
-from src.crown_m0.model import M0CoarseToFineNet, M0CrownNet
+from src.crown_m0.losses import coarse_to_fine_loss, m0_loss, tangent_coarse_to_fine_loss
+from src.crown_m0.model import M0CoarseToFineNet, M0CrownNet, M0TangentCoarseToFineNet
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,13 +34,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chamfer-points", type=int, default=2048)
     parser.add_argument("--normal-weight", type=float, default=0.05)
     parser.add_argument("--output-points", type=int, default=16384)
-    parser.add_argument("--decoder", choices=["direct", "coarse_to_fine"], default="direct")
+    parser.add_argument(
+        "--decoder",
+        choices=["direct", "coarse_to_fine", "coarse_to_fine_tangent"],
+        default="direct",
+    )
     parser.add_argument("--coarse-points", type=int, default=8192)
     parser.add_argument("--first-factor", type=int, default=4)
     parser.add_argument("--second-factor", type=int, default=2)
     parser.add_argument("--repulsion-weight", type=float, default=0.10)
     parser.add_argument("--uniformity-weight", type=float, default=0.01)
     parser.add_argument("--offset-weight", type=float, default=0.001)
+    parser.add_argument("--point-to-plane-weight", type=float, default=0.50)
+    parser.add_argument("--local-plane-weight", type=float, default=0.20)
+    parser.add_argument("--normal-drift-weight", type=float, default=0.50)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -105,6 +112,12 @@ def main() -> None:
 
 
 def build_model(args: argparse.Namespace) -> torch.nn.Module:
+    if args.decoder == "coarse_to_fine_tangent":
+        return M0TangentCoarseToFineNet(
+            coarse_points=args.coarse_points,
+            first_factor=args.first_factor,
+            second_factor=args.second_factor,
+        )
     if args.decoder == "coarse_to_fine":
         return M0CoarseToFineNet(
             coarse_points=args.coarse_points,
@@ -122,7 +135,20 @@ def run_epoch(
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
-    if args.decoder == "coarse_to_fine":
+    if args.decoder == "coarse_to_fine_tangent":
+        sums = {
+            "loss": 0.0,
+            "coarse_chamfer": 0.0,
+            "middle_chamfer": 0.0,
+            "fine_chamfer": 0.0,
+            "fine_normal": 0.0,
+            "fine_point_to_plane": 0.0,
+            "repulsion": 0.0,
+            "uniformity": 0.0,
+            "local_plane": 0.0,
+            "normal_drift": 0.0,
+        }
+    elif args.decoder == "coarse_to_fine":
         sums = {
             "loss": 0.0,
             "coarse_chamfer": 0.0,
@@ -145,7 +171,27 @@ def run_epoch(
         prep_arch_index = batch["prep_arch_index"].to(args.device, non_blocking=True)
 
         with torch.set_grad_enabled(training):
-            if args.decoder == "coarse_to_fine":
+            if args.decoder == "coarse_to_fine_tangent":
+                outputs = model(
+                    prep,
+                    antagonist,
+                    tooth_index,
+                    prep_arch_index,
+                    return_stages=True,
+                )
+                loss, metrics = tangent_coarse_to_fine_loss(
+                    outputs["stages"],
+                    outputs["offsets"],
+                    crown,
+                    chamfer_points=args.chamfer_points,
+                    normal_weight=args.normal_weight,
+                    point_to_plane_weight=args.point_to_plane_weight,
+                    local_plane_weight=args.local_plane_weight,
+                    repulsion_weight=args.repulsion_weight,
+                    uniformity_weight=args.uniformity_weight,
+                    normal_drift_weight=args.normal_drift_weight,
+                )
+            elif args.decoder == "coarse_to_fine":
                 outputs = model(
                     prep,
                     antagonist,

@@ -127,6 +127,132 @@ def coarse_to_fine_loss(
     }
 
 
+def tangent_sibling_repulsion_loss(
+    offsets: torch.Tensor,
+    parent_normals: torch.Tensor,
+    min_distance: float,
+) -> torch.Tensor:
+    factor = offsets.shape[2]
+    if factor < 2:
+        return offsets.new_tensor(0.0)
+    normals = F.normalize(parent_normals, dim=-1).unsqueeze(2)
+    tangent_offsets = offsets - (offsets * normals).sum(dim=-1, keepdim=True) * normals
+    distances = torch.cdist(tangent_offsets, tangent_offsets)
+    eye = torch.eye(factor, device=offsets.device, dtype=torch.bool)
+    distances = distances.masked_fill(eye[None, None, :, :], float("inf"))
+    nearest = distances.min(dim=-1).values
+    return torch.relu(min_distance - nearest).square().mean()
+
+
+def local_plane_consistency_loss(points: torch.Tensor, count: int = 1024, neighbors: int = 8) -> torch.Tensor:
+    sampled = sample_points(points, count)
+    xyz = sampled[..., :3]
+    normals = F.normalize(sampled[..., 3:6], dim=-1)
+    distances = torch.cdist(xyz, xyz)
+    eye = torch.eye(xyz.shape[1], device=xyz.device, dtype=torch.bool)
+    distances = distances.masked_fill(eye[None, :, :], float("inf"))
+    neighbor_idx = distances.topk(k=min(neighbors, xyz.shape[1] - 1), largest=False).indices
+    batch_idx = torch.arange(xyz.shape[0], device=xyz.device)[:, None, None]
+    neighbor_xyz = xyz[batch_idx, neighbor_idx]
+    signed_height = ((neighbor_xyz - xyz.unsqueeze(2)) * normals.unsqueeze(2)).sum(dim=-1)
+    return signed_height.abs().mean()
+
+
+def stage_surface_losses(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    count: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    pred_sample = sample_points(pred, count)
+    target_sample = sample_points(target, count)
+    pred_xyz = pred_sample[..., :3]
+    target_xyz = target_sample[..., :3]
+    distances = torch.cdist(pred_xyz, target_xyz)
+    pred_min, pred_to_target = distances.min(dim=2)
+    target_min = distances.min(dim=1).values
+    chamfer = pred_min.mean() + target_min.mean()
+
+    pred_normals = F.normalize(pred_sample[..., 3:6], dim=-1)
+    target_normals = F.normalize(target_sample[..., 3:6], dim=-1)
+    gathered_target_xyz = torch.gather(
+        target_xyz,
+        1,
+        pred_to_target.unsqueeze(-1).expand(-1, -1, 3),
+    )
+    gathered_target_normals = torch.gather(
+        target_normals,
+        1,
+        pred_to_target.unsqueeze(-1).expand(-1, -1, 3),
+    )
+    normal = (1.0 - (pred_normals * gathered_target_normals).sum(dim=-1)).mean()
+    point_to_plane = (
+        (pred_xyz - gathered_target_xyz) * gathered_target_normals
+    ).sum(dim=-1).abs().mean()
+    return chamfer, normal, point_to_plane
+
+
+def tangent_coarse_to_fine_loss(
+    stages: list[torch.Tensor],
+    offsets: list[torch.Tensor],
+    target: torch.Tensor,
+    *,
+    chamfer_points: int = 8192,
+    normal_weight: float = 0.20,
+    point_to_plane_weight: float = 0.50,
+    local_plane_weight: float = 0.20,
+    repulsion_weight: float = 0.10,
+    uniformity_weight: float = 0.01,
+    normal_drift_weight: float = 0.50,
+    stage_weights: tuple[float, float, float] = (0.2, 0.3, 0.5),
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if len(stages) != 3 or len(offsets) != 2:
+        raise ValueError("tangent coarse-to-fine loss expects three stages and two offset tensors")
+
+    total = target.new_tensor(0.0)
+    stage_values = []
+    for stage, weight in zip(stages, stage_weights):
+        chamfer, normal, point_to_plane = stage_surface_losses(stage, target, count=chamfer_points)
+        stage_loss = chamfer + normal_weight * normal + point_to_plane_weight * point_to_plane
+        total = total + weight * stage_loss
+        stage_values.append((chamfer, normal, point_to_plane))
+
+    repulsion = tangent_sibling_repulsion_loss(
+        offsets[0],
+        stages[0][..., 3:6],
+        min_distance=0.05,
+    ) + tangent_sibling_repulsion_loss(
+        offsets[1],
+        stages[1][..., 3:6],
+        min_distance=0.025,
+    )
+    uniformity = point_uniformity_loss(stages[-1])
+    local_plane = local_plane_consistency_loss(stages[-1])
+    normal_drift = sum(
+        ((item * F.normalize(parent[..., 3:6], dim=-1).unsqueeze(2)).sum(dim=-1)).abs().mean()
+        for item, parent in zip(offsets, stages[:-1])
+    )
+    total = (
+        total
+        + repulsion_weight * repulsion
+        + uniformity_weight * uniformity
+        + local_plane_weight * local_plane
+        + normal_drift_weight * normal_drift
+    )
+    return total, {
+        "loss": float(total.detach().cpu()),
+        "coarse_chamfer": float(stage_values[0][0].detach().cpu()),
+        "middle_chamfer": float(stage_values[1][0].detach().cpu()),
+        "fine_chamfer": float(stage_values[2][0].detach().cpu()),
+        "fine_normal": float(stage_values[2][1].detach().cpu()),
+        "fine_point_to_plane": float(stage_values[2][2].detach().cpu()),
+        "repulsion": float(repulsion.detach().cpu()),
+        "uniformity": float(uniformity.detach().cpu()),
+        "local_plane": float(local_plane.detach().cpu()),
+        "normal_drift": float(normal_drift.detach().cpu()),
+    }
+
+
 def edge_length_loss(vertices: torch.Tensor, template_vertices: torch.Tensor, edges: torch.Tensor) -> torch.Tensor:
     if edges.numel() == 0:
         return vertices.new_tensor(0.0)

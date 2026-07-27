@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 
 from src.crown_m0.dataset import CrownDataset, discover_cases
 from src.crown_m0.io import write_ply, write_xyz
-from src.crown_m0.model import M0CoarseToFineNet, M0CrownNet
+from src.crown_m0.model import M0CoarseToFineNet, M0CrownNet, M0TangentCoarseToFineNet
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,7 +35,13 @@ def main() -> None:
 
     checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
     checkpoint_args = checkpoint.get("args", {})
-    if checkpoint_args.get("decoder") == "coarse_to_fine":
+    if checkpoint_args.get("decoder") == "coarse_to_fine_tangent":
+        model = M0TangentCoarseToFineNet(
+            coarse_points=int(checkpoint_args.get("coarse_points", 8192)),
+            first_factor=int(checkpoint_args.get("first_factor", 4)),
+            second_factor=int(checkpoint_args.get("second_factor", 2)),
+        ).to(args.device)
+    elif checkpoint_args.get("decoder") == "coarse_to_fine":
         model = M0CoarseToFineNet(
             coarse_points=int(checkpoint_args.get("coarse_points", 8192)),
             first_factor=int(checkpoint_args.get("first_factor", 4)),

@@ -22,10 +22,10 @@ if str(ROOT) not in sys.path:
 
 from src.crown_m0.dataset import CrownDataset, discover_cases
 from src.crown_m0.io import write_ply, write_xyz
-from src.crown_m0.model import M0CoarseToFineNet, M0CrownNet
+from src.crown_m0.model import M0CoarseToFineNet, M0CrownNet, M0TangentCoarseToFineNet
 
 
-OFFICIAL_STL_METHOD = "alpha_clean_taubin"
+DEFAULT_STL_METHOD = "tangent_mls_poisson"
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,9 +45,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment-name", default="m0_baseline")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--sample-points", type=int, default=12000)
+    parser.add_argument(
+        "--stl-method",
+        choices=["alpha_clean_taubin", "tangent_mls_poisson"],
+        default=DEFAULT_STL_METHOD,
+    )
     parser.add_argument("--alpha", type=float, default=1.2)
     parser.add_argument("--smooth-iterations", type=int, default=25)
     parser.add_argument("--subdivide-iterations", type=int, default=1)
+    parser.add_argument("--poisson-depth", type=int, default=8)
+    parser.add_argument("--poisson-threads", type=int, default=8)
+    parser.add_argument("--mls-iterations", type=int, default=2)
+    parser.add_argument("--poisson-density-quantile", type=float, default=0.02)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -85,7 +94,13 @@ def main() -> None:
 def load_model(args: argparse.Namespace) -> torch.nn.Module:
     checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
     checkpoint_args = checkpoint.get("args", {})
-    if checkpoint_args.get("decoder") == "coarse_to_fine":
+    if checkpoint_args.get("decoder") == "coarse_to_fine_tangent":
+        model = M0TangentCoarseToFineNet(
+            coarse_points=int(checkpoint_args.get("coarse_points", 8192)),
+            first_factor=int(checkpoint_args.get("first_factor", 4)),
+            second_factor=int(checkpoint_args.get("second_factor", 2)),
+        ).to(args.device)
+    elif checkpoint_args.get("decoder") == "coarse_to_fine":
         model = M0CoarseToFineNet(
             coarse_points=int(checkpoint_args.get("coarse_points", 8192)),
             first_factor=int(checkpoint_args.get("first_factor", 4)),
@@ -145,11 +160,11 @@ def evaluate_case(
     case_dir = sample_dir / "cases" / stem
     case_dir.mkdir(parents=True, exist_ok=True)
 
-    row = {"case": str(case_path), "stem": stem, "ok": False, "stl_method": OFFICIAL_STL_METHOD, "error": ""}
+    row = {"case": str(case_path), "stem": stem, "ok": False, "stl_method": args.stl_method, "error": ""}
     pred_npy = case_dir / f"{stem}_pred.npy"
     pred_xyz = case_dir / f"{stem}_pred.xyz"
     pred_ply = case_dir / f"{stem}_pred.ply"
-    pred_stl = case_dir / f"{stem}_pred_{OFFICIAL_STL_METHOD}.stl"
+    pred_stl = case_dir / f"{stem}_pred_{args.stl_method}.stl"
     gt_stl_copy = case_dir / f"{stem}_GT_technician.stl"
 
     try:
@@ -160,12 +175,22 @@ def evaluate_case(
         row.update(prefix_metrics("point", point_metrics(pred_local[:, :3], gt_local[:, :3])))
 
         pred_original = restore_original_coordinates(pred_local, case_path)
-        pred_mesh = reconstruct_alpha_clean(
-            pred_original[:, :3],
-            args.alpha,
-            smooth_iterations=args.smooth_iterations,
-            subdivide_iterations=args.subdivide_iterations,
-        )
+        if args.stl_method == "tangent_mls_poisson":
+            pred_mesh = reconstruct_tangent_mls_poisson(
+                pred_original,
+                depth=args.poisson_depth,
+                threads=args.poisson_threads,
+                mls_iterations=args.mls_iterations,
+                density_quantile=args.poisson_density_quantile,
+                smooth_iterations=min(args.smooth_iterations, 10),
+            )
+        else:
+            pred_mesh = reconstruct_alpha_clean(
+                pred_original[:, :3],
+                args.alpha,
+                smooth_iterations=args.smooth_iterations,
+                subdivide_iterations=args.subdivide_iterations,
+            )
         ok = o3d.io.write_triangle_mesh(str(pred_stl), pred_mesh, write_ascii=False)
         if not ok:
             raise RuntimeError(f"failed to write {pred_stl}")
@@ -241,6 +266,123 @@ def reconstruct_alpha_clean(
     mesh.compute_triangle_normals()
     if len(mesh.triangles) == 0:
         raise ValueError("empty alpha_clean mesh")
+    return mesh
+
+
+def project_points_mls(
+    xyz: np.ndarray,
+    reference_normals: np.ndarray,
+    *,
+    iterations: int,
+    neighbors: int = 24,
+    strength: float = 0.75,
+) -> tuple[np.ndarray, np.ndarray]:
+    projected = np.asarray(xyz, dtype=np.float64).copy()
+    reference = np.asarray(reference_normals, dtype=np.float64).copy()
+    reference /= np.maximum(np.linalg.norm(reference, axis=1, keepdims=True), 1e-8)
+    for _ in range(max(iterations, 0)):
+        tree = cKDTree(projected)
+        _, indices = tree.query(projected, k=min(neighbors, len(projected)))
+        neighborhoods = projected[indices]
+        centroids = neighborhoods.mean(axis=1)
+        normals = reference[indices].mean(axis=1)
+        normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-8)
+        flip = np.sum(normals * reference, axis=1) < 0
+        normals[flip] *= -1.0
+        signed = np.sum((centroids - projected) * normals, axis=1)
+        signed = np.clip(signed, -0.08, 0.08)
+        projected += strength * signed[:, None] * normals
+        reference = normals
+    return projected, reference
+
+
+def keep_largest_mesh_component(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
+    if len(mesh.triangles) == 0:
+        return mesh
+    labels, counts, _ = mesh.cluster_connected_triangles()
+    counts_np = np.asarray(counts)
+    if counts_np.size > 1:
+        labels_np = np.asarray(labels)
+        mesh.remove_triangles_by_mask(labels_np != int(np.argmax(counts_np)))
+        mesh.remove_unreferenced_vertices()
+    return mesh
+
+
+def reconstruct_tangent_mls_poisson(
+    points: np.ndarray,
+    *,
+    depth: int,
+    threads: int,
+    mls_iterations: int,
+    density_quantile: float,
+    smooth_iterations: int,
+) -> o3d.geometry.TriangleMesh:
+    xyz = np.asarray(points[:, :3], dtype=np.float64)
+    normals = np.asarray(points[:, 3:6], dtype=np.float64)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    pcd.normals = o3d.utility.Vector3dVector(normals)
+    clean, indices = pcd.remove_statistical_outlier(nb_neighbors=32, std_ratio=1.75)
+    if len(clean.points) >= 1000:
+        clean.normals = o3d.utility.Vector3dVector(normals[np.asarray(indices)])
+        pcd = clean
+    pcd = pcd.voxel_down_sample(voxel_size=0.08)
+    pcd.normalize_normals()
+    xyz = np.asarray(pcd.points)
+    normals = np.asarray(pcd.normals)
+
+    xyz, normals = project_points_mls(
+        xyz,
+        normals,
+        iterations=mls_iterations,
+    )
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    pcd.normals = o3d.utility.Vector3dVector(normals)
+    pcd.normalize_normals()
+
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd,
+        depth=depth,
+        scale=1.05,
+        linear_fit=False,
+        n_threads=threads,
+    )
+    densities_np = np.asarray(densities)
+    if densities_np.size:
+        threshold = float(np.quantile(densities_np, density_quantile))
+        mesh.remove_vertices_by_mask(densities_np < threshold)
+
+    xyz_clean = np.asarray(pcd.points)
+    bbox = o3d.geometry.AxisAlignedBoundingBox(
+        xyz_clean.min(axis=0) - 0.20,
+        xyz_clean.max(axis=0) + 0.20,
+    )
+    mesh = mesh.crop(bbox)
+    mesh = keep_largest_mesh_component(mesh)
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_duplicated_vertices()
+    mesh.remove_non_manifold_edges()
+    mesh = keep_largest_mesh_component(mesh)
+    if len(mesh.triangles) > 50000:
+        mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=50000)
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_duplicated_vertices()
+        mesh.remove_non_manifold_edges()
+        mesh.remove_unreferenced_vertices()
+        mesh = keep_largest_mesh_component(mesh)
+    if smooth_iterations > 0:
+        mesh = mesh.filter_smooth_taubin(
+            number_of_iterations=smooth_iterations,
+            lambda_filter=0.5,
+            mu=-0.53,
+        )
+    mesh.compute_vertex_normals()
+    mesh.compute_triangle_normals()
+    if len(mesh.triangles) == 0:
+        raise ValueError("empty tangent MLS Poisson mesh")
     return mesh
 
 
@@ -333,8 +475,10 @@ def summarize_rows(rows: list[dict]) -> dict[str, dict]:
         "triangles",
         "surface_area",
     ]
-    summary = {OFFICIAL_STL_METHOD: {"method": OFFICIAL_STL_METHOD, "n": len(ok_rows)}}
-    item = summary[OFFICIAL_STL_METHOD]
+    source_rows = ok_rows or rows
+    method = str(source_rows[0].get("stl_method", DEFAULT_STL_METHOD)) if source_rows else DEFAULT_STL_METHOD
+    summary = {method: {"method": method, "n": len(ok_rows)}}
+    item = summary[method]
     for key in metric_keys:
         values = np.asarray([float(row[key]) for row in ok_rows if row.get(key) not in ("", None)], dtype=float)
         if values.size:
@@ -349,7 +493,7 @@ def write_config(path: Path, args: argparse.Namespace) -> None:
     for key, value in payload.items():
         if isinstance(value, Path):
             payload[key] = str(value)
-    payload["official_stl_method"] = OFFICIAL_STL_METHOD
+    payload["official_stl_method"] = args.stl_method
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
