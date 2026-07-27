@@ -84,7 +84,8 @@ def main() -> None:
 
 def load_model(args: argparse.Namespace) -> M0CrownNet:
     checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
-    model = M0CrownNet().to(args.device)
+    checkpoint_args = checkpoint.get("args", {})
+    model = M0CrownNet(output_points=int(checkpoint_args.get("output_points", 16384))).to(args.device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     return model
