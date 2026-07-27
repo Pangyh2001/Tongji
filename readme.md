@@ -657,26 +657,26 @@ python3 scripts/predict_m0.py \
 
 ### 正式实验结果目录规范
 
-后续所有正式实验结果统一写入 
-esult/，不再写入 
-uns/、predictions/ 或 isualizations/ 作为主结果目录。
+后续所有正式实验结果统一写入 `result/`，不再写入 `runs/`、`predictions/` 或 `visualizations/` 作为主结果目录。
 
 结果目录必须包含实验日期，格式为：
 
-`	ext
+```text
 result/YYYYMMDD/<experiment_name>/
-`
+```
 
-例如 M0 baseline 正式评估输出为：
+例如 dynamic template deformation 版 M0 baseline 正式评估输出为：
 
-`	ext
-result/20260726/m0_baseline/
-`
+```text
+result/20260727/m0_template/
+```
 
-每个实验目录下按样本集继续分层，例如：
+正式实验默认只输出 test split，不再额外复制 `representative10/` STL 子集。若后续需要汇报用代表样本，只保存代表样本名单，或直接从 `test/cases/` 中挑选。
 
-`	ext
-result/YYYYMMDD/m0_baseline/
+目录结构：
+
+```text
+result/YYYYMMDD/m0_template/
   config.json
   summary_by_sample_set.csv
   test/
@@ -685,78 +685,71 @@ result/YYYYMMDD/m0_baseline/
     summary_metrics.json
     cases/
       <case_id>/
-        <case_id>_pred.npy
-        <case_id>_pred.xyz
-        <case_id>_pred.ply
-        <case_id>_pred_alpha_clean.stl
+        <case_id>_pred_vertices.npy
+        <case_id>_pred_vertices.xyz
+        <case_id>_pred_vertices.ply
+        <case_id>_pred_template_displacement.stl
+        <case_id>_selected_template.stl
         <case_id>_GT_technician.stl
-  representative10/
-    metrics_by_case.csv
-    summary_metrics.csv
-    summary_metrics.json
-    cases/
-      <case_id>/
-        <case_id>_pred_alpha_clean.stl
-        <case_id>_GT_technician.stl
-`
+```
 
 要求：
 
-1. 每个样本集必须有逐病例指标 metrics_by_case.csv。
-2. 每个样本集必须有汇总指标 summary_metrics.csv/json。
-3. 每个样本的 GT STL 和预测 STL 必须放在同一个 cases/<case_id>/ 文件夹内，便于直接打开对比。
-4. 点云输出模型的正式 STL 方法统一为 lpha_clean。
-5. lpha_raw、poisson_clean_taubin、pa_clean 等只作为 STL 后处理消融，不进入正式 M0-M3 主比较。
-6. 
-esult/ 是生成结果目录，默认不提交到 Git。
-
-运行 M0 baseline 正式实验：
-
-`ash
-python3 scripts/run_m0_official_experiment.py   --checkpoint runs/m0_new/best.pt   --date YYYYMMDD   --experiment-name m0_baseline
-`
+1. `test/metrics_by_case.csv` 必须包含逐病例指标。
+2. `test/summary_metrics.csv/json` 必须包含汇总指标。
+3. 每个样本的 GT STL、预测 STL 和动态检索到的模板 STL 必须放在同一个 `cases/<case_id>/` 文件夹内。
+4. 后续正式 M0-M3 的 STL 输出统一采用 `template_displacement`。
+5. `result/` 是生成结果目录，默认不提交到 Git。
 
 ### 统一 STL 生成规则
 
-正式实验中，所有以点云作为模型输出的方法必须使用同一套 STL 生成后处理，避免模型差异和 STL 重建差异混在一起。
-
-本项目统一采用：
+后续正式 M0-M3 不再把“无拓扑点云 -> alpha-shape/Poisson -> STL”作为主 STL 输出路线，而统一改为动态模板变形：
 
 ```text
-alpha_clean
+train split GT STL
+-> 构建动态模板库
+-> 每个 case 按 tooth_id、prep_arch 和 prep 几何特征检索最合适模板
+-> 网络预测该模板每个 vertex 的 displacement
+-> template_vertices + displacement
+-> 沿用 selected_template_faces
+-> 直接导出 STL
 ```
 
-其流程为：
+也就是：
 
 ```text
-预测点云
--> 统计离群点去除
--> 半径离群点去除
--> 0.06 mm voxel down-sample
--> alpha-shape 重建，alpha = 1.2
--> 删除退化/重复三角形和非流形边
--> 保留最大连通分量
--> 计算顶点/三角面法向
--> 输出 STL
+official_stl_method = template_displacement
 ```
 
-正式主实验应统一调用：
+这不是“每个模板单独做一次实验”。模板库只提供 case 级初始形态，同一个模型在一次训练中学习不同模板的 displacement。M0、M1、M2、M3 的区别应体现在输入、网络模块和 loss 上，而不是 STL 重建算法上：
+
+```text
+M0: dynamic template + prep + antagonist + tooth/arch -> template displacement
+M1: M0 + margin line input -> template displacement
+M2: M1 + margin-line anchored / ring-wise module -> template displacement
+M3: M2 + margin/risk-weighted loss -> template displacement
+```
+
+当前新增的 dynamic template deformation baseline 使用：
 
 ```bash
-python3 scripts/run_stl_reconstruction_experiments.py \
-  --methods alpha_clean \
-  --prediction-dir predictions/<experiment_name> \
-  --output-dir visualizations/<experiment_name>_stl
+python3 scripts/build_crown_template_library.py \
+  --output-dir templates/m0_dynamic_library_4096 \
+  --target-triangles 8192 \
+  --max-templates-per-group 6
+
+python3 scripts/train_m0_template.py \
+  --template-index templates/m0_dynamic_library_4096/template_index.json \
+  --output-dir runs/m0_template
+
+python3 scripts/run_m0_template_official_experiment.py \
+  --checkpoint runs/m0_template/best.pt \
+  --template-index templates/m0_dynamic_library_4096/template_index.json \
+  --date YYYYMMDD \
+  --experiment-name m0_template
 ```
 
-`scripts/run_stl_reconstruction_experiments.py` 的默认方法已经设置为 `alpha_clean`。如果不显式传入 `--methods`，也会使用该统一流程。
+旧的 `alpha_clean_taubin` 仍可作为点云 baseline 的兼容导出或 STL 后处理消融，但不作为后续正式 M0-M3 的主 STL 方法。单个全局模板也不作为正式方法，因为一个牙位的模板不能稳定覆盖全部后牙牙位。
 
-`alpha_raw`、`poisson_raw`、`poisson_clean_taubin`、`bpa_clean` 只用于 STL 后处理消融实验，不用于 M0-M3 正式模型对比。正式比较中，M0、M1、M2、M3 必须使用相同 split、相同评价指标和相同 STL 生成方法。
 
-如果某个模型未来直接输出 mesh/STL，而不是点云，应在结果表中单独标注其输出表示；不能和点云模型的 alpha_clean 后处理结果混称为同一种 STL 生成流程。
 
-## 总结
-
-本方案基于真实后牙 CAD/CAM 配对病例，以患者上下颌模型、技师最终设计冠和 margin line 为核心数据基础。模型层面引入边缘线锚定的 ring-wise 生成机制，评价层面建立 R1-R5 临床风险分区和 CRCS 临床风险加权评分，并通过接触图、专家盲评和小样本实体冠验证连接真实 CAD/CAM 工作流。
-
-核心贡献不是简单追求整体几何相似，而是将 AI 牙冠生成结果转化为可分区量化、可解释、能提示人工修改重点的临床质量评价体系。

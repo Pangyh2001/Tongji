@@ -33,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-file", type=Path, default=None, help="Optional fixed split JSON from make_m0_split.py.")
     parser.add_argument("--chamfer-points", type=int, default=2048)
     parser.add_argument("--normal-weight", type=float, default=0.05)
+    parser.add_argument("--output-points", type=int, default=16384)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -73,7 +74,7 @@ def main() -> None:
         pin_memory=args.device.startswith("cuda"),
     )
 
-    model = M0CrownNet().to(args.device)
+    model = M0CrownNet(output_points=args.output_points).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     best_val = float("inf")
 
