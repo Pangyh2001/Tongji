@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--point-to-plane-weight", type=float, default=0.50)
     parser.add_argument("--local-plane-weight", type=float, default=0.20)
     parser.add_argument("--normal-drift-weight", type=float, default=0.50)
-    parser.add_argument("--grid-weight", type=float, default=1.0)
+    parser.add_argument("--grid-weight", type=float, default=100.0)
     parser.add_argument("--dpsr-resolution", type=int, default=128)
     parser.add_argument("--dpsr-sigma", type=float, default=2.0)
     parser.add_argument("--roi-half-extent-mm", type=float, default=12.0)

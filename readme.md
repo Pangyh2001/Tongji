@@ -791,11 +791,11 @@ loss = Chamfer(point) + normal_weight * normal_loss
 python3 scripts/train_m0.py \
   --data-dir data \
   --split-file splits/m0_patient_split_seed20260706.json \
-  --output-dir runs/m0_dmc_dpsr128 \
+  --output-dir runs/m0_dmc_dpsr128_grid100 \
   --decoder dmc_dpsr \
   --dpsr-resolution 128 \
   --dpsr-sigma 2.0 \
-  --grid-weight 1.0 \
+  --grid-weight 100.0 \
   --epochs 60 \
   --batch-size 2 \
   --chamfer-points 4096
@@ -805,14 +805,27 @@ python3 scripts/train_m0.py \
 
 ```bash
 python3 scripts/run_m0_official_experiment.py \
-  --checkpoint runs/m0_dmc_dpsr128/best.pt \
+  --checkpoint runs/m0_dmc_dpsr128_grid100/best.pt \
   --date YYYYMMDD \
-  --experiment-name m0_dmc_dpsr128 \
+  --experiment-name m0_dmc_dpsr128_grid100 \
   --stl-method dmc_dpsr_marching_cubes \
   --smooth-iterations 5
 ```
 
 每个测试病例除 GT STL、预测点云和预测 STL 外，还保存 `<case_id>_pred_psr_grid.npy`，用于复核零水平集和重复导出。该实验在完整测试集的指标和 STL 人工检查完成前属于候选方法，不覆盖原始 M0 定义。
+
+### 2026-07-28 快速验证结果
+
+固定 test split 共 70 例，两组实验都成功生成 140 个 GT/预测 STL：
+
+| 实验 | grid weight | 点云 symmetric RMS | STL symmetric RMS | 视觉结果 |
+|---|---:|---:|---:|---|
+| `m0_dmc_dpsr128` | 1 | 0.363 mm | 0.703 mm | 连续、无明显尖刺，但过度平滑 |
+| `m0_dmc_dpsr128_grid100` | 100 | 0.382 mm | **0.558 mm** | 连续流形，窝沟和边缘转折更清楚 |
+
+作为参照，之前 `m0_tangent_c2f64k` 的 STL symmetric RMS 约为 0.638 mm。DMC-DPSR 的高网格权重版本在 STL 指标上更优，并显著减少点云后处理产生的尖刺、坑洼和碎面，因此后续 DMC-DPSR 实验默认使用 `grid_weight=100`。
+
+当前限制：预测冠仍存在病例特异性细节不足，最差病例容易趋向平均牙形。该问题不能继续靠 STL 后处理解决，后续应优先改进输入上下文、margin line、局部特征编码和区域风险损失。
 
 参考实现和论文：
 
