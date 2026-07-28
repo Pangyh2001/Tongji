@@ -615,6 +615,22 @@ def regional_surface_metrics(
 def mesh_stats(mesh: o3d.geometry.TriangleMesh) -> dict:
     labels, counts, _ = mesh.cluster_connected_triangles()
     counts_np = np.asarray(counts)
+    triangles = np.asarray(mesh.triangles)
+    edges = np.sort(
+        np.concatenate(
+            [
+                triangles[:, [0, 1]],
+                triangles[:, [1, 2]],
+                triangles[:, [2, 0]],
+            ],
+            axis=0,
+        ),
+        axis=1,
+    )
+    unique_edges = np.unique(edges, axis=0)
+    euler_characteristic = int(len(mesh.vertices) - len(unique_edges) + len(triangles))
+    watertight = bool(mesh.is_watertight())
+    genus = float((2 - euler_characteristic) / 2) if watertight else float("nan")
     return {
         "vertices": int(len(mesh.vertices)),
         "triangles": int(len(mesh.triangles)),
@@ -623,6 +639,10 @@ def mesh_stats(mesh: o3d.geometry.TriangleMesh) -> dict:
         "surface_area": float(mesh.get_surface_area()),
         "edge_manifold": bool(mesh.is_edge_manifold()),
         "vertex_manifold": bool(mesh.is_vertex_manifold()),
+        "watertight": watertight,
+        "euler_characteristic": euler_characteristic,
+        "genus": genus,
+        "topology_ok": bool(watertight and abs(genus) < 0.5),
     }
 
 
@@ -666,6 +686,9 @@ def summarize_rows(rows: list[dict]) -> dict[str, dict]:
         "r1_stl_gt_to_pred_hd95",
         "triangles",
         "surface_area",
+        "watertight",
+        "genus",
+        "topology_ok",
     ]
     source_rows = ok_rows or rows
     method = str(source_rows[0].get("stl_method", DEFAULT_STL_METHOD)) if source_rows else DEFAULT_STL_METHOD

@@ -866,6 +866,25 @@ python3 scripts/run_m0_official_experiment.py \
 
 除整体 point/STL RMS 与 HD95 外，评估脚本同时汇总 `margin_point_*`、`margin_stl_*`、`r1_point_*` 和 `r1_stl_*` 指标。
 
+### M0-M3 首轮结果（2026-07-28）
+
+固定 test split 70 例，四组均使用 `128^3 DPSR + grid_weight=100 + Marching Cubes`：
+
+| 方法 | 点云 RMS | STL RMS | margin 点 RMS | R1 点 RMS | R1 STL RMS | genus>0 |
+|---|---:|---:|---:|---:|---:|---:|
+| M0 | 0.382 | 0.557 | 0.366 | 0.358 | 2.181 | 20/70 |
+| M1 | 0.358 | **0.494** | 0.268 | 0.262 | 1.210 | 11/70 |
+| M2 | 0.358 | 0.520 | **0.084** | 0.219 | 1.051 | **7/70** |
+| M3 | **0.348** | 0.508 | 0.090 | **0.209** | **0.779** | 11/70 |
+
+结论：
+
+- M1 的整体 STL 几何误差最低。
+- M2 的 margin 点贴合和拓扑可靠性最好。
+- M3 的整体点云、R1 点云和 R1 STL 指标最好。
+- `edge_manifold=True` 不能发现封闭贯穿孔，因此正式评价必须同时报告 `watertight`、Euler characteristic、`genus` 和 `topology_ok`。
+- 当前 M2 是更稳妥的 STL 候选；M3 需要加入拓扑约束后再判断是否作为完整模型。
+
 参考实现和论文：
 
 - DMC, From Mesh Completion to AI Designed Crown: <https://arxiv.org/abs/2501.04914>
