@@ -222,6 +222,7 @@ def evaluate_case(
         write_ply(pred_ply, pred_local)
 
         row.update(prefix_metrics("point", point_metrics(pred_local[:, :3], gt_local[:, :3])))
+        row.update(point_normal_metrics(pred_local, gt_local))
         row.update(
             prefix_metrics(
                 "margin_point",
@@ -563,6 +564,13 @@ def surface_metrics(pred_xyz: np.ndarray, gt_xyz: np.ndarray) -> dict[str, float
     pred_to_gt, _ = cKDTree(gt_xyz).query(pred_xyz, k=1)
     gt_to_pred, _ = cKDTree(pred_xyz).query(gt_xyz, k=1)
     both = np.concatenate([pred_to_gt, gt_to_pred])
+    precision_0p3 = float(np.mean(pred_to_gt <= 0.3))
+    recall_0p3 = float(np.mean(gt_to_pred <= 0.3))
+    fscore_0p3 = (
+        2.0 * precision_0p3 * recall_0p3 / (precision_0p3 + recall_0p3)
+        if precision_0p3 + recall_0p3 > 0
+        else 0.0
+    )
     return {
         "pred_to_gt_mean": mean(pred_to_gt),
         "pred_to_gt_rms": rms(pred_to_gt),
@@ -572,6 +580,30 @@ def surface_metrics(pred_xyz: np.ndarray, gt_xyz: np.ndarray) -> dict[str, float
         "gt_to_pred_hd95": percentile(gt_to_pred, 95),
         "symmetric_mean": mean(both),
         "symmetric_rms": rms(both),
+        "precision_0p3": precision_0p3,
+        "recall_0p3": recall_0p3,
+        "fscore_0p3": fscore_0p3,
+    }
+
+
+def point_normal_metrics(
+    pred: np.ndarray,
+    gt: np.ndarray,
+) -> dict[str, float]:
+    if pred.shape[1] < 6 or gt.shape[1] < 6:
+        return {
+            "point_normal_cosine_similarity": float("nan"),
+            "point_normal_angular_error_deg": float("nan"),
+        }
+    _, nearest = cKDTree(gt[:, :3]).query(pred[:, :3], k=1)
+    pred_normals = pred[:, 3:6].astype(np.float64)
+    gt_normals = gt[nearest, 3:6].astype(np.float64)
+    pred_normals /= np.maximum(np.linalg.norm(pred_normals, axis=1, keepdims=True), 1e-8)
+    gt_normals /= np.maximum(np.linalg.norm(gt_normals, axis=1, keepdims=True), 1e-8)
+    cosine = np.clip(np.sum(pred_normals * gt_normals, axis=1), -1.0, 1.0)
+    return {
+        "point_normal_cosine_similarity": float(np.mean(cosine)),
+        "point_normal_angular_error_deg": float(np.degrees(np.arccos(cosine)).mean()),
     }
 
 
@@ -667,23 +699,33 @@ def summarize_rows(rows: list[dict]) -> dict[str, dict]:
         "point_symmetric_rms",
         "point_pred_to_gt_hd95",
         "point_gt_to_pred_hd95",
+        "point_fscore_0p3",
+        "point_precision_0p3",
+        "point_recall_0p3",
+        "point_normal_cosine_similarity",
+        "point_normal_angular_error_deg",
         "stl_pred_to_gt_rms",
         "stl_gt_to_pred_rms",
         "stl_symmetric_rms",
         "stl_pred_to_gt_hd95",
         "stl_gt_to_pred_hd95",
+        "stl_fscore_0p3",
+        "stl_precision_0p3",
+        "stl_recall_0p3",
         "margin_point_mean",
         "margin_point_rms",
         "margin_point_hd95",
         "r1_point_symmetric_rms",
         "r1_point_pred_to_gt_hd95",
         "r1_point_gt_to_pred_hd95",
+        "r1_point_fscore_0p3",
         "margin_stl_mean",
         "margin_stl_rms",
         "margin_stl_hd95",
         "r1_stl_symmetric_rms",
         "r1_stl_pred_to_gt_hd95",
         "r1_stl_gt_to_pred_hd95",
+        "r1_stl_fscore_0p3",
         "triangles",
         "surface_area",
         "watertight",
