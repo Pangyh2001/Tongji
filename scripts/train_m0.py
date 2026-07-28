@@ -142,15 +142,7 @@ def build_model(args: argparse.Namespace) -> torch.nn.Module:
             dpsr_sigma=args.dpsr_sigma,
             roi_half_extent_mm=args.roi_half_extent_mm,
         )
-    if args.decoder == "dmc_dpsr":
-        sums = {
-            "loss": 0.0,
-            "chamfer": 0.0,
-            "normal": 0.0,
-            "grid_mse": 0.0,
-            "grid_l1": 0.0,
-        }
-    elif args.decoder == "coarse_to_fine_tangent":
+    if args.decoder == "coarse_to_fine_tangent":
         return M0TangentCoarseToFineNet(
             coarse_points=args.coarse_points,
             first_factor=args.first_factor,
@@ -173,7 +165,15 @@ def run_epoch(
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
-    if args.decoder == "coarse_to_fine_tangent":
+    if args.decoder == "dmc_dpsr":
+        sums = {
+            "loss": 0.0,
+            "chamfer": 0.0,
+            "normal": 0.0,
+            "grid_mse": 0.0,
+            "grid_l1": 0.0,
+        }
+    elif args.decoder == "coarse_to_fine_tangent":
         sums = {
             "loss": 0.0,
             "coarse_chamfer": 0.0,
