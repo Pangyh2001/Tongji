@@ -54,6 +54,37 @@ def m0_loss(
     return loss, {"loss": float(loss.detach().cpu()), "chamfer": float(cd.detach().cpu()), "normal": float(normal_loss.detach().cpu())}
 
 
+def dmc_dpsr_loss(
+    pred_points: torch.Tensor,
+    pred_grid: torch.Tensor,
+    target_points: torch.Tensor,
+    target_grid: torch.Tensor,
+    *,
+    chamfer_points: int = 4096,
+    normal_weight: float = 0.05,
+    grid_weight: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Jointly supervise DMC points and the reconstructed Poisson indicator."""
+    point_loss, point_metrics = m0_loss(
+        pred_points,
+        target_points,
+        chamfer_points=chamfer_points,
+        normal_weight=normal_weight,
+    )
+    pred_indicator = torch.tanh(pred_grid)
+    target_indicator = torch.tanh(target_grid)
+    grid_mse = F.mse_loss(pred_indicator, target_indicator)
+    grid_l1 = F.l1_loss(pred_indicator, target_indicator)
+    loss = point_loss + grid_weight * grid_mse
+    return loss, {
+        "loss": float(loss.detach().cpu()),
+        "chamfer": point_metrics["chamfer"],
+        "normal": point_metrics["normal"],
+        "grid_mse": float(grid_mse.detach().cpu()),
+        "grid_l1": float(grid_l1.detach().cpu()),
+    }
+
+
 def sibling_repulsion_loss(offsets: torch.Tensor, min_distance: float) -> torch.Tensor:
     """Keep children generated from one parent from collapsing together."""
     factor = offsets.shape[2]

@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from .dpsr import DPSR
+
 
 class PointNetEncoder(nn.Module):
     def __init__(self, in_channels: int = 6, feature_dim: int = 512) -> None:
@@ -331,6 +333,188 @@ class M0TangentCoarseToFineNet(M0CoarseToFineNet):
             max_tangent_offset_mm=second_max_tangent_offset_mm,
             max_normal_offset_mm=second_max_normal_offset_mm,
         )
+
+
+class M0DMCDPSRNet(nn.Module):
+    """DMC-style Transformer + Folding decoder with differentiable PSR."""
+
+    def __init__(
+        self,
+        *,
+        model_dim: int = 256,
+        context_tokens_per_input: int = 256,
+        num_queries: int = 256,
+        fold_step: int = 8,
+        transformer_layers: int = 3,
+        tooth_count: int = 16,
+        arch_count: int = 3,
+        dpsr_resolution: int = 128,
+        dpsr_sigma: float = 2.0,
+        roi_half_extent_mm: float = 12.0,
+    ) -> None:
+        super().__init__()
+        self.context_tokens_per_input = context_tokens_per_input
+        self.num_queries = num_queries
+        self.fold_step = fold_step
+        self.patch_points = fold_step * fold_step
+        self.output_points = num_queries * self.patch_points
+        self.output_channels = 6
+        self.roi_half_extent_mm = roi_half_extent_mm
+
+        self.point_projection = nn.Sequential(
+            nn.Linear(6, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, model_dim),
+        )
+        self.position_projection = nn.Sequential(
+            nn.Linear(3, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, model_dim),
+        )
+        self.input_type_embedding = nn.Embedding(2, model_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=8,
+            dim_feedforward=model_dim * 4,
+            dropout=0.1,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.context_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=transformer_layers,
+            norm=nn.LayerNorm(model_dim),
+        )
+
+        self.query_embedding = nn.Embedding(num_queries, model_dim)
+        self.tooth_embedding = nn.Embedding(tooth_count, 64)
+        self.arch_embedding = nn.Embedding(arch_count, 16)
+        self.condition_projection = nn.Linear(80, model_dim)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=model_dim,
+            nhead=8,
+            dim_feedforward=model_dim * 4,
+            dropout=0.1,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.crown_decoder = nn.TransformerDecoder(
+            decoder_layer,
+            num_layers=transformer_layers,
+            norm=nn.LayerNorm(model_dim),
+        )
+        self.coarse_head = nn.Sequential(
+            nn.Linear(model_dim, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 3),
+        )
+
+        grid_axis = torch.linspace(-1.0, 1.0, steps=fold_step)
+        grid_u, grid_v = torch.meshgrid(grid_axis, grid_axis, indexing="ij")
+        self.register_buffer("folding_grid", torch.stack([grid_u.flatten(), grid_v.flatten()], dim=0))
+        self.folding_1 = nn.Sequential(
+            nn.Conv1d(model_dim + 2, 256, 1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(256, 128, 1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(128, 3, 1),
+        )
+        self.folding_2 = nn.Sequential(
+            nn.Conv1d(model_dim + 3, 256, 1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(256, 128, 1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(128, 3, 1),
+        )
+        self.normal_head = nn.Sequential(
+            nn.Conv1d(model_dim + 3, 128, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(128, 3, 1),
+        )
+        self.dpsr = DPSR(resolution=dpsr_resolution, sigma=dpsr_sigma)
+
+    def _sample_context(self, points: torch.Tensor) -> torch.Tensor:
+        count = min(self.context_tokens_per_input, points.shape[1])
+        indices = torch.linspace(
+            0,
+            points.shape[1] - 1,
+            steps=count,
+            device=points.device,
+        ).long()
+        return points[:, indices]
+
+    def points_to_grid(self, points: torch.Tensor) -> torch.Tensor:
+        xyz = points[..., :3]
+        normals = points[..., 3:6]
+        normalized_xyz = (
+            xyz + self.roi_half_extent_mm
+        ) / (2.0 * self.roi_half_extent_mm)
+        normalized_xyz = normalized_xyz.clamp(1e-4, 1.0 - 1e-4)
+        return self.dpsr(normalized_xyz, normals)
+
+    def forward(
+        self,
+        prep: torch.Tensor,
+        antagonist: torch.Tensor,
+        tooth_index: torch.Tensor,
+        prep_arch_index: torch.Tensor,
+        *,
+        return_grid: bool = False,
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        prep_tokens = self._sample_context(prep)
+        antagonist_tokens = self._sample_context(antagonist)
+        context_points = torch.cat([prep_tokens, antagonist_tokens], dim=1)
+        token_types = torch.cat(
+            [
+                torch.zeros(prep_tokens.shape[1], dtype=torch.long, device=prep.device),
+                torch.ones(antagonist_tokens.shape[1], dtype=torch.long, device=prep.device),
+            ]
+        )
+        context = (
+            self.point_projection(context_points)
+            + self.position_projection(context_points[..., :3])
+            + self.input_type_embedding(token_types)[None]
+        )
+        memory = self.context_encoder(context)
+
+        condition = self.condition_projection(
+            torch.cat(
+                [
+                    self.tooth_embedding(tooth_index),
+                    self.arch_embedding(prep_arch_index),
+                ],
+                dim=-1,
+            )
+        )
+        queries = self.query_embedding.weight[None].expand(prep.shape[0], -1, -1)
+        query_features = self.crown_decoder(queries + condition[:, None, :], memory)
+        coarse = self.coarse_head(query_features)
+
+        batch, queries_count, channels = query_features.shape
+        features = query_features.reshape(batch * queries_count, channels, 1).expand(
+            -1,
+            -1,
+            self.patch_points,
+        )
+        grid = self.folding_grid[None].expand(batch * queries_count, -1, -1)
+        folded_1 = self.folding_1(torch.cat([features, grid], dim=1))
+        folded_2 = self.folding_2(torch.cat([features, folded_1], dim=1))
+        relative = folded_2.transpose(1, 2).reshape(batch, queries_count, self.patch_points, 3)
+        xyz_raw = coarse.unsqueeze(2) + relative
+        xyz = torch.tanh(xyz_raw / self.roi_half_extent_mm) * self.roi_half_extent_mm
+
+        normal_input = torch.cat([features, folded_2], dim=1)
+        normals = self.normal_head(normal_input).transpose(1, 2)
+        normals = normals.reshape(batch, queries_count, self.patch_points, 3)
+        normals = torch.nn.functional.normalize(normals, dim=-1, eps=1e-6)
+        points = torch.cat([xyz, normals], dim=-1).flatten(1, 2)
+        if return_grid:
+            return {"points": points, "psr_grid": self.points_to_grid(points)}
+        return points
 
 
 class M0TemplateDeformNet(nn.Module):

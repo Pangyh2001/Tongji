@@ -13,6 +13,7 @@ import numpy as np
 import open3d as o3d
 import torch
 from scipy.spatial import cKDTree
+from skimage import measure
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -22,7 +23,12 @@ if str(ROOT) not in sys.path:
 
 from src.crown_m0.dataset import CrownDataset, discover_cases
 from src.crown_m0.io import write_ply, write_xyz
-from src.crown_m0.model import M0CoarseToFineNet, M0CrownNet, M0TangentCoarseToFineNet
+from src.crown_m0.model import (
+    M0CoarseToFineNet,
+    M0CrownNet,
+    M0DMCDPSRNet,
+    M0TangentCoarseToFineNet,
+)
 
 
 DEFAULT_STL_METHOD = "tangent_mls_poisson"
@@ -47,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-points", type=int, default=12000)
     parser.add_argument(
         "--stl-method",
-        choices=["alpha_clean_taubin", "tangent_mls_poisson"],
+        choices=["alpha_clean_taubin", "tangent_mls_poisson", "dmc_dpsr_marching_cubes"],
         default=DEFAULT_STL_METHOD,
     )
     parser.add_argument("--alpha", type=float, default=1.2)
@@ -67,13 +73,14 @@ def main() -> None:
 
     output_dir = args.output_root / args.date / args.experiment_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    write_config(output_dir / "config.json", args)
-
     records = discover_cases(args.data_dir)
     by_case = {str(record.train_dir.parent): record for record in records}
     sample_sets = load_sample_sets(args)
 
     model = load_model(args)
+    if isinstance(model, M0DMCDPSRNet):
+        args.roi_half_extent_mm = model.roi_half_extent_mm
+    write_config(output_dir / "config.json", args)
     all_summary_rows = []
     for sample_set, cases in sample_sets.items():
         selected_records = [by_case[case] for case in cases if case in by_case]
@@ -94,7 +101,18 @@ def main() -> None:
 def load_model(args: argparse.Namespace) -> torch.nn.Module:
     checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
     checkpoint_args = checkpoint.get("args", {})
-    if checkpoint_args.get("decoder") == "coarse_to_fine_tangent":
+    if checkpoint_args.get("decoder") == "dmc_dpsr":
+        model = M0DMCDPSRNet(
+            model_dim=int(checkpoint_args.get("dmc_model_dim", 256)),
+            context_tokens_per_input=int(checkpoint_args.get("dmc_context_tokens", 256)),
+            num_queries=int(checkpoint_args.get("dmc_queries", 256)),
+            fold_step=int(checkpoint_args.get("dmc_fold_step", 8)),
+            transformer_layers=int(checkpoint_args.get("dmc_transformer_layers", 3)),
+            dpsr_resolution=int(checkpoint_args.get("dpsr_resolution", 128)),
+            dpsr_sigma=float(checkpoint_args.get("dpsr_sigma", 2.0)),
+            roi_half_extent_mm=float(checkpoint_args.get("roi_half_extent_mm", 12.0)),
+        ).to(args.device)
+    elif checkpoint_args.get("decoder") == "coarse_to_fine_tangent":
         model = M0TangentCoarseToFineNet(
             coarse_points=int(checkpoint_args.get("coarse_points", 8192)),
             first_factor=int(checkpoint_args.get("first_factor", 4)),
@@ -135,16 +153,30 @@ def run_sample_set(
     rows = []
     with torch.no_grad():
         for batch in tqdm(loader, desc=sample_dir.name):
-            pred = model(
+            model_args = (
                 batch["prep"].to(args.device),
                 batch["antagonist"].to(args.device),
                 batch["tooth_index"].to(args.device),
                 batch["prep_arch_index"].to(args.device),
-            ).cpu().numpy()
+            )
+            if isinstance(model, M0DMCDPSRNet):
+                outputs = model(*model_args, return_grid=True)
+                pred = outputs["points"].cpu().numpy()
+                pred_grids = outputs["psr_grid"].cpu().numpy()
+            else:
+                pred = model(*model_args).cpu().numpy()
+                pred_grids = [None] * len(pred)
             crown = batch["crown"].cpu().numpy()
             for i, case in enumerate(batch["case_id"]):
                 case_path = Path(case)
-                row = evaluate_case(case_path, pred[i].astype(np.float32), crown[i].astype(np.float32), sample_dir, args)
+                row = evaluate_case(
+                    case_path,
+                    pred[i].astype(np.float32),
+                    crown[i].astype(np.float32),
+                    sample_dir,
+                    args,
+                    pred_grid=None if pred_grids[i] is None else pred_grids[i].astype(np.float32),
+                )
                 rows.append(row)
     return rows
 
@@ -155,6 +187,8 @@ def evaluate_case(
     gt_local: np.ndarray,
     sample_dir: Path,
     args: argparse.Namespace,
+    *,
+    pred_grid: np.ndarray | None = None,
 ) -> dict:
     stem = safe_case_name(case_path, args.data_dir)
     case_dir = sample_dir / "cases" / stem
@@ -164,6 +198,7 @@ def evaluate_case(
     pred_npy = case_dir / f"{stem}_pred.npy"
     pred_xyz = case_dir / f"{stem}_pred.xyz"
     pred_ply = case_dir / f"{stem}_pred.ply"
+    pred_grid_npy = case_dir / f"{stem}_pred_psr_grid.npy"
     pred_stl = case_dir / f"{stem}_pred_{args.stl_method}.stl"
     gt_stl_copy = case_dir / f"{stem}_GT_technician.stl"
 
@@ -175,7 +210,17 @@ def evaluate_case(
         row.update(prefix_metrics("point", point_metrics(pred_local[:, :3], gt_local[:, :3])))
 
         pred_original = restore_original_coordinates(pred_local, case_path)
-        if args.stl_method == "tangent_mls_poisson":
+        if args.stl_method == "dmc_dpsr_marching_cubes":
+            if pred_grid is None:
+                raise ValueError("DMC DPSR STL export requires a predicted PSR grid")
+            np.save(pred_grid_npy, pred_grid)
+            pred_mesh = reconstruct_dpsr_grid(
+                pred_grid,
+                case_path,
+                roi_half_extent_mm=float(args.roi_half_extent_mm),
+                smooth_iterations=min(args.smooth_iterations, 5),
+            )
+        elif args.stl_method == "tangent_mls_poisson":
             pred_mesh = reconstruct_tangent_mls_poisson(
                 pred_original,
                 depth=args.poisson_depth,
@@ -212,6 +257,7 @@ def evaluate_case(
                 "pred_npy": str(pred_npy),
                 "pred_xyz": str(pred_xyz),
                 "pred_ply": str(pred_ply),
+                "pred_psr_grid": str(pred_grid_npy) if pred_grid is not None else "",
                 "pred_stl": str(pred_stl),
                 "gt_stl": str(gt_stl_copy),
             }
@@ -219,6 +265,52 @@ def evaluate_case(
     except Exception as exc:
         row["error"] = f"{type(exc).__name__}: {exc}"
     return row
+
+
+def reconstruct_dpsr_grid(
+    grid: np.ndarray,
+    case_path: Path,
+    *,
+    roi_half_extent_mm: float,
+    smooth_iterations: int,
+) -> o3d.geometry.TriangleMesh:
+    """Extract the model's learned zero level set without point-cloud remeshing."""
+    if not (float(grid.min()) <= 0.0 <= float(grid.max())):
+        raise ValueError(
+            f"PSR grid has no zero crossing: min={float(grid.min()):.6f}, "
+            f"max={float(grid.max()):.6f}"
+        )
+    vertices, faces, _, _ = measure.marching_cubes(grid, level=0.0)
+    resolution = np.asarray(grid.shape, dtype=np.float64)
+    local_vertices = (
+        vertices.astype(np.float64) / resolution[None, :]
+    ) * (2.0 * roi_half_extent_mm) - roi_half_extent_mm
+    meta = json.loads((case_path / "train" / "metadata.json").read_text(encoding="utf-8"))
+    center = np.asarray(meta["coordinate_processing"]["center_xyz_mm"], dtype=np.float64)
+    vertices_original = local_vertices + center[None, :]
+
+    mesh = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(vertices_original),
+        o3d.utility.Vector3iVector(faces.astype(np.int32)),
+    )
+    mesh = keep_largest_mesh_component(mesh)
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_duplicated_vertices()
+    mesh.remove_non_manifold_edges()
+    mesh.remove_unreferenced_vertices()
+    mesh = keep_largest_mesh_component(mesh)
+    if smooth_iterations > 0:
+        mesh = mesh.filter_smooth_taubin(
+            number_of_iterations=smooth_iterations,
+            lambda_filter=0.5,
+            mu=-0.53,
+        )
+    mesh.compute_vertex_normals()
+    mesh.compute_triangle_normals()
+    if len(mesh.triangles) == 0:
+        raise ValueError("empty DPSR marching-cubes mesh")
+    return mesh
 
 
 def reconstruct_alpha_clean(

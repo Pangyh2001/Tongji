@@ -14,8 +14,18 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.crown_m0.dataset import CrownDataset, discover_cases, split_by_patient
-from src.crown_m0.losses import coarse_to_fine_loss, m0_loss, tangent_coarse_to_fine_loss
-from src.crown_m0.model import M0CoarseToFineNet, M0CrownNet, M0TangentCoarseToFineNet
+from src.crown_m0.losses import (
+    coarse_to_fine_loss,
+    dmc_dpsr_loss,
+    m0_loss,
+    tangent_coarse_to_fine_loss,
+)
+from src.crown_m0.model import (
+    M0CoarseToFineNet,
+    M0CrownNet,
+    M0DMCDPSRNet,
+    M0TangentCoarseToFineNet,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-points", type=int, default=16384)
     parser.add_argument(
         "--decoder",
-        choices=["direct", "coarse_to_fine", "coarse_to_fine_tangent"],
+        choices=["direct", "coarse_to_fine", "coarse_to_fine_tangent", "dmc_dpsr"],
         default="direct",
     )
     parser.add_argument("--coarse-points", type=int, default=8192)
@@ -48,6 +58,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--point-to-plane-weight", type=float, default=0.50)
     parser.add_argument("--local-plane-weight", type=float, default=0.20)
     parser.add_argument("--normal-drift-weight", type=float, default=0.50)
+    parser.add_argument("--grid-weight", type=float, default=1.0)
+    parser.add_argument("--dpsr-resolution", type=int, default=128)
+    parser.add_argument("--dpsr-sigma", type=float, default=2.0)
+    parser.add_argument("--roi-half-extent-mm", type=float, default=12.0)
+    parser.add_argument("--dmc-model-dim", type=int, default=256)
+    parser.add_argument("--dmc-context-tokens", type=int, default=256)
+    parser.add_argument("--dmc-queries", type=int, default=256)
+    parser.add_argument("--dmc-fold-step", type=int, default=8)
+    parser.add_argument("--dmc-transformer-layers", type=int, default=3)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -112,7 +131,26 @@ def main() -> None:
 
 
 def build_model(args: argparse.Namespace) -> torch.nn.Module:
-    if args.decoder == "coarse_to_fine_tangent":
+    if args.decoder == "dmc_dpsr":
+        return M0DMCDPSRNet(
+            model_dim=args.dmc_model_dim,
+            context_tokens_per_input=args.dmc_context_tokens,
+            num_queries=args.dmc_queries,
+            fold_step=args.dmc_fold_step,
+            transformer_layers=args.dmc_transformer_layers,
+            dpsr_resolution=args.dpsr_resolution,
+            dpsr_sigma=args.dpsr_sigma,
+            roi_half_extent_mm=args.roi_half_extent_mm,
+        )
+    if args.decoder == "dmc_dpsr":
+        sums = {
+            "loss": 0.0,
+            "chamfer": 0.0,
+            "normal": 0.0,
+            "grid_mse": 0.0,
+            "grid_l1": 0.0,
+        }
+    elif args.decoder == "coarse_to_fine_tangent":
         return M0TangentCoarseToFineNet(
             coarse_points=args.coarse_points,
             first_factor=args.first_factor,
@@ -171,7 +209,26 @@ def run_epoch(
         prep_arch_index = batch["prep_arch_index"].to(args.device, non_blocking=True)
 
         with torch.set_grad_enabled(training):
-            if args.decoder == "coarse_to_fine_tangent":
+            if args.decoder == "dmc_dpsr":
+                outputs = model(
+                    prep,
+                    antagonist,
+                    tooth_index,
+                    prep_arch_index,
+                    return_grid=True,
+                )
+                with torch.no_grad():
+                    target_grid = model.points_to_grid(crown)
+                loss, metrics = dmc_dpsr_loss(
+                    outputs["points"],
+                    outputs["psr_grid"],
+                    crown,
+                    target_grid,
+                    chamfer_points=args.chamfer_points,
+                    normal_weight=args.normal_weight,
+                    grid_weight=args.grid_weight,
+                )
+            elif args.decoder == "coarse_to_fine_tangent":
                 outputs = model(
                     prep,
                     antagonist,

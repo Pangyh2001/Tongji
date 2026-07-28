@@ -760,3 +760,63 @@ python3 scripts/run_m0_official_experiment.py \
 
 旧的 direct 16k/32k/64k MLP、无切平面约束 coarse-to-fine、dynamic template deformation 和 `alpha_clean_taubin` 结果保留为方法消融，不作为当前正式 M0 输出。增加输出点数必须由模型的切平面局部展开层学习，禁止把低密度预测点云机械插值后冒充高密度模型输出。
 
+## DMC-DPSR 文献复现实验（2026-07-28）
+
+前述 `tangent coarse-to-fine 64k + MLS/Poisson` 在数值指标上有所改善，但测试 STL 仍出现尖刺和坑洼，因此不再继续通过单纯增加点数解决表面问题。本轮新增独立实验 `m0_dmc_dpsr128`，按 DMC 和 Shape As Points 的核心路线实现：
+
+```text
+prep + antagonist + tooth/arch
+-> context point tokens
+-> Transformer encoder/decoder
+-> Folding 2D patches
+-> 16384 oriented surface points
+-> differentiable Poisson surface reconstruction (DPSR)
+-> 128^3 indicator grid
+-> zero-level Marching Cubes
+-> STL
+```
+
+训练目标为：
+
+```text
+loss = Chamfer(point) + normal_weight * normal_loss
+     + grid_weight * MSE(predicted_indicator, GT_indicator)
+```
+
+这里 STL 直接来自网络训练过的隐式指示场，不再对预测点云运行 alpha-shape、MLS 或 Open3D Poisson。GT 上限测试表明 `64^3` 对牙冠高度方向量化过粗，因此正式快速验证直接使用论文路线中的 `128^3` 网格。固定局部 ROI 为 `[-12, 12] mm`，覆盖当前数据中全部牙冠点。
+
+训练命令：
+
+```bash
+python3 scripts/train_m0.py \
+  --data-dir data \
+  --split-file splits/m0_patient_split_seed20260706.json \
+  --output-dir runs/m0_dmc_dpsr128 \
+  --decoder dmc_dpsr \
+  --dpsr-resolution 128 \
+  --dpsr-sigma 2.0 \
+  --grid-weight 1.0 \
+  --epochs 60 \
+  --batch-size 2 \
+  --chamfer-points 4096
+```
+
+评估命令：
+
+```bash
+python3 scripts/run_m0_official_experiment.py \
+  --checkpoint runs/m0_dmc_dpsr128/best.pt \
+  --date YYYYMMDD \
+  --experiment-name m0_dmc_dpsr128 \
+  --stl-method dmc_dpsr_marching_cubes \
+  --smooth-iterations 5
+```
+
+每个测试病例除 GT STL、预测点云和预测 STL 外，还保存 `<case_id>_pred_psr_grid.npy`，用于复核零水平集和重复导出。该实验在完整测试集的指标和 STL 人工检查完成前属于候选方法，不覆盖原始 M0 定义。
+
+参考实现和论文：
+
+- DMC, From Mesh Completion to AI Designed Crown: <https://arxiv.org/abs/2501.04914>
+- DCrownFormer: <https://papers.miccai.org/miccai-2024/194-Paper0638.html>
+- Shape As Points / DPSR: <https://papers.nips.cc/paper/2021/hash/6cd9313ed34ef58bad3fdd504355e72c-Abstract.html>
+- FoldingNet: <https://arxiv.org/abs/1712.07262>
