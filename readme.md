@@ -916,6 +916,15 @@ STL 直接来自模型训练过的 DPSR 隐式指示场，不再对预测点云�
 | M2 | M1 + 64 margin anchors + 6 ring groups | 56 | 0.521 | 0.978 | **63/70 (90.0%)** |
 | M3 | M2 + margin risk-weighted loss | 60 | 0.508 | **0.860** | 59/70 (84.3%) |
 
+新增完整几何指标：
+
+| 方法 | Point F-score@0.3 | STL F-score@0.3 | Normal cosine | Normal error |
+|---|---:|---:|---:|---:|
+| M0 | 0.591 | 0.407 | 0.577 | 49.30 deg |
+| M1 | 0.640 | **0.453** | **0.646** | **44.06 deg** |
+| M2 | 0.649 | 0.421 | 0.466 | 57.51 deg |
+| M3 | **0.670** | 0.439 | 0.462 | 57.66 deg |
+
 结论：
 
 - M1 的整体 STL 几何误差最低。
@@ -929,9 +938,38 @@ STL 直接来自模型训练过的 DPSR 隐式指示场，不再对预测点云�
 ```text
 result/20260728/m0_m3_dmc_dpsr_comparison.csv
 result/20260728/m0_m3_dmc_dpsr_comparison.json
+result/20260728/m0_m3_all_metrics_by_method.csv
+result/20260728/m0_m3_all_metrics_by_method.json
+result/20260728/m0_m3_all_metrics_transposed.csv
 result/20260728/m0_m3_topology_failures.csv
 result/20260728/m0_m3_stl_comparison.png
 ```
+
+### 当前实际计算的评估指标
+
+以下指标已实际写入每个实验的 `test/metrics_by_case.csv`，并在 `summary_metrics.csv/json` 中统计 mean、median 和 max：
+
+1. 整体预测点云：
+   `pred_to_gt / gt_to_pred mean`、RMS、HD95、symmetric mean/RMS、precision、recall、F-score@0.3 mm、normal cosine similarity、normal angular error。
+2. 最终预测 STL：
+   `pred_to_gt / gt_to_pred mean`、RMS、HD95、symmetric mean/RMS、precision、recall、F-score@0.3 mm。
+3. Margin line：
+   margin 到预测点云和预测 STL 的 mean、RMS、HD95。
+4. R1 边缘区：
+   点云和 STL 的双向 mean、RMS、HD95、symmetric mean/RMS、F-score@0.3 mm。R1 定义为距 margin line 不超过 `1.0 mm` 的区域。
+5. 网格质量与拓扑：
+   vertices、triangles、components、largest component、surface area、edge/vertex manifold、watertight、Euler characteristic、genus、`topology_ok`。
+
+尚未进入本轮正式结果的计划指标：
+
+- R2-R5 分区指标
+- 咬合接触面积、穿透深度和接触位置误差
+- 邻接接触、邻接间隙和穿透
+- 内表面适合度、粘接间隙和预备体穿透
+- margin shortfall / overhang 独立分类
+- 专家盲评、临床可接受率和 CRCS
+
+这些指标不能从当前汇总表推断，需在完成区域标注、接触阈值和内外表面定义后单独实现。
 
 ### 统一 10 病例 STL 对比集
 
