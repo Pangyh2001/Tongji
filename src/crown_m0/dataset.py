@@ -84,12 +84,14 @@ class CrownDataset(Dataset):
         prep_points: int = 8192,
         antagonist_points: int = 8192,
         crown_points: int = 16384,
+        margin_points: int = 1024,
         seed: int = 20260621,
     ) -> None:
         self.records = records
         self.prep_points = prep_points
         self.antagonist_points = antagonist_points
         self.crown_points = crown_points
+        self.margin_points = margin_points
         self.seed = seed
 
     def __len__(self) -> int:
@@ -102,10 +104,16 @@ class CrownDataset(Dataset):
         prep = ensure_2d_float32(np.load(record.train_dir / "prep_points.npy"), 6, "prep_points")
         antagonist = ensure_2d_float32(np.load(record.train_dir / "antagonist_points.npy"), 6, "antagonist_points")
         crown = ensure_2d_float32(np.load(record.train_dir / "crown_points.npy"), 6, "crown_points")
+        margin_path = record.train_dir / "margin_points.npy"
+        if margin_path.exists():
+            margin = ensure_2d_float32(np.load(margin_path), 3, "margin_points")
+        else:
+            margin = np.zeros((self.margin_points, 3), dtype=np.float32)
 
         prep = resample_rows(prep, self.prep_points, rng)
         antagonist = resample_rows(antagonist, self.antagonist_points, rng)
         crown = resample_rows(crown, self.crown_points, rng)
+        margin = resample_rows(margin, self.margin_points, rng)
 
         tooth_index = TOOTH_TO_INDEX.get(record.tooth_id)
         if tooth_index is None:
@@ -115,6 +123,7 @@ class CrownDataset(Dataset):
             "prep": torch.from_numpy(prep),
             "antagonist": torch.from_numpy(antagonist),
             "crown": torch.from_numpy(crown),
+            "margin": torch.from_numpy(margin),
             "tooth_index": torch.tensor(tooth_index, dtype=torch.long),
             "prep_arch_index": torch.tensor(ARCH_TO_INDEX.get(record.prep_arch, 2), dtype=torch.long),
             "case_id": str(record.train_dir.parent),
@@ -136,4 +145,3 @@ def _infer_patient_id(case_dir: Path, meta: dict) -> str:
     case_name = str(meta.get("case") or case_dir.name)
     match = re.match(r"(.+)_\d{2}$", case_name)
     return match.group(1) if match else case_name
-

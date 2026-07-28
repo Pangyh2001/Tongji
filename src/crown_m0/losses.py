@@ -63,6 +63,11 @@ def dmc_dpsr_loss(
     chamfer_points: int = 4096,
     normal_weight: float = 0.05,
     grid_weight: float = 1.0,
+    margin: torch.Tensor | None = None,
+    margin_anchor_weight: float = 0.0,
+    margin_risk_weight: float = 0.0,
+    margin_risk_alpha: float = 3.0,
+    margin_risk_sigma_mm: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Jointly supervise DMC points and the reconstructed Poisson indicator."""
     point_loss, point_metrics = m0_loss(
@@ -75,13 +80,57 @@ def dmc_dpsr_loss(
     target_indicator = torch.tanh(target_grid)
     grid_mse = F.mse_loss(pred_indicator, target_indicator)
     grid_l1 = F.l1_loss(pred_indicator, target_indicator)
-    loss = point_loss + grid_weight * grid_mse
+    margin_anchor = pred_points.new_tensor(0.0)
+    margin_risk = pred_points.new_tensor(0.0)
+    if margin is not None and (margin_anchor_weight > 0 or margin_risk_weight > 0):
+        margin_sample = sample_points(margin, 512)
+        pred_sample = sample_points(pred_points, chamfer_points)
+        target_sample = sample_points(target_points, chamfer_points)
+        if margin_anchor_weight > 0:
+            margin_to_pred = torch.cdist(
+                margin_sample[..., :3],
+                pred_sample[..., :3],
+            ).min(dim=2).values
+            margin_anchor = margin_to_pred.mean()
+        if margin_risk_weight > 0:
+            pairwise = torch.cdist(
+                pred_sample[..., :3],
+                target_sample[..., :3],
+            )
+            pred_min = pairwise.min(dim=2).values
+            target_min = pairwise.min(dim=1).values
+            pred_margin_distance = torch.cdist(
+                pred_sample[..., :3],
+                margin_sample[..., :3],
+            ).min(dim=2).values
+            target_margin_distance = torch.cdist(
+                target_sample[..., :3],
+                margin_sample[..., :3],
+            ).min(dim=2).values
+            pred_weights = 1.0 + margin_risk_alpha * torch.exp(
+                -pred_margin_distance.square() / (2.0 * margin_risk_sigma_mm**2)
+            )
+            target_weights = 1.0 + margin_risk_alpha * torch.exp(
+                -target_margin_distance.square() / (2.0 * margin_risk_sigma_mm**2)
+            )
+            margin_risk = (
+                (pred_min * pred_weights).sum(dim=1) / pred_weights.sum(dim=1)
+                + (target_min * target_weights).sum(dim=1) / target_weights.sum(dim=1)
+            ).mean()
+    loss = (
+        point_loss
+        + grid_weight * grid_mse
+        + margin_anchor_weight * margin_anchor
+        + margin_risk_weight * margin_risk
+    )
     return loss, {
         "loss": float(loss.detach().cpu()),
         "chamfer": point_metrics["chamfer"],
         "normal": point_metrics["normal"],
         "grid_mse": float(grid_mse.detach().cpu()),
         "grid_l1": float(grid_l1.detach().cpu()),
+        "margin_anchor": float(margin_anchor.detach().cpu()),
+        "margin_risk": float(margin_risk.detach().cpu()),
     }
 
 

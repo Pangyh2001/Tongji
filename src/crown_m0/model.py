@@ -351,6 +351,10 @@ class M0DMCDPSRNet(nn.Module):
         dpsr_resolution: int = 128,
         dpsr_sigma: float = 2.0,
         roi_half_extent_mm: float = 12.0,
+        use_margin: bool = False,
+        margin_anchor_queries: int = 0,
+        ring_groups: int = 0,
+        margin_anchor_max_offset_mm: float = 1.5,
     ) -> None:
         super().__init__()
         self.context_tokens_per_input = context_tokens_per_input
@@ -360,6 +364,14 @@ class M0DMCDPSRNet(nn.Module):
         self.output_points = num_queries * self.patch_points
         self.output_channels = 6
         self.roi_half_extent_mm = roi_half_extent_mm
+        self.use_margin = use_margin
+        self.margin_anchor_queries = int(margin_anchor_queries)
+        self.ring_groups = int(ring_groups)
+        self.margin_anchor_max_offset_mm = float(margin_anchor_max_offset_mm)
+        if self.margin_anchor_queries > self.num_queries:
+            raise ValueError("margin_anchor_queries cannot exceed num_queries")
+        if self.margin_anchor_queries and not self.use_margin:
+            raise ValueError("margin-anchored queries require use_margin=True")
 
         self.point_projection = nn.Sequential(
             nn.Linear(6, 128),
@@ -371,7 +383,7 @@ class M0DMCDPSRNet(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(128, model_dim),
         )
-        self.input_type_embedding = nn.Embedding(2, model_dim)
+        self.input_type_embedding = nn.Embedding(3 if use_margin else 2, model_dim)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=model_dim,
             nhead=8,
@@ -387,6 +399,7 @@ class M0DMCDPSRNet(nn.Module):
         )
 
         self.query_embedding = nn.Embedding(num_queries, model_dim)
+        self.ring_embedding = nn.Embedding(ring_groups, model_dim) if ring_groups > 0 else None
         self.tooth_embedding = nn.Embedding(tooth_count, 64)
         self.arch_embedding = nn.Embedding(arch_count, 16)
         self.condition_projection = nn.Linear(80, model_dim)
@@ -463,17 +476,32 @@ class M0DMCDPSRNet(nn.Module):
         tooth_index: torch.Tensor,
         prep_arch_index: torch.Tensor,
         *,
+        margin: torch.Tensor | None = None,
         return_grid: bool = False,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         prep_tokens = self._sample_context(prep)
         antagonist_tokens = self._sample_context(antagonist)
-        context_points = torch.cat([prep_tokens, antagonist_tokens], dim=1)
-        token_types = torch.cat(
-            [
-                torch.zeros(prep_tokens.shape[1], dtype=torch.long, device=prep.device),
-                torch.ones(antagonist_tokens.shape[1], dtype=torch.long, device=prep.device),
-            ]
-        )
+        context_parts = [prep_tokens, antagonist_tokens]
+        type_parts = [
+            torch.zeros(prep_tokens.shape[1], dtype=torch.long, device=prep.device),
+            torch.ones(antagonist_tokens.shape[1], dtype=torch.long, device=prep.device),
+        ]
+        if self.use_margin:
+            if margin is None:
+                raise ValueError("margin input is required for this DMC-DPSR model")
+            margin_tokens = self._sample_context(margin)
+            margin_features = torch.nn.functional.pad(margin_tokens, (0, 3))
+            context_parts.append(margin_features)
+            type_parts.append(
+                torch.full(
+                    (margin_tokens.shape[1],),
+                    2,
+                    dtype=torch.long,
+                    device=prep.device,
+                )
+            )
+        context_points = torch.cat(context_parts, dim=1)
+        token_types = torch.cat(type_parts)
         context = (
             self.point_projection(context_points)
             + self.position_projection(context_points[..., :3])
@@ -491,8 +519,32 @@ class M0DMCDPSRNet(nn.Module):
             )
         )
         queries = self.query_embedding.weight[None].expand(prep.shape[0], -1, -1)
+        if self.ring_embedding is not None:
+            ring_index = (
+                torch.arange(self.num_queries, device=prep.device) * self.ring_groups
+            ) // self.num_queries
+            queries = queries + self.ring_embedding(ring_index)[None]
         query_features = self.crown_decoder(queries + condition[:, None, :], memory)
         coarse = self.coarse_head(query_features)
+        if self.margin_anchor_queries > 0:
+            anchor_index = torch.linspace(
+                0,
+                margin.shape[1] - 1,
+                steps=self.margin_anchor_queries,
+                device=margin.device,
+            ).long()
+            anchors = margin[:, anchor_index, :3]
+            anchor_offsets = (
+                torch.tanh(coarse[:, : self.margin_anchor_queries])
+                * self.margin_anchor_max_offset_mm
+            )
+            coarse = torch.cat(
+                [
+                    anchors + anchor_offsets,
+                    coarse[:, self.margin_anchor_queries :],
+                ],
+                dim=1,
+            )
 
         batch, queries_count, channels = query_features.shape
         features = query_features.reshape(batch * queries_count, channels, 1).expand(

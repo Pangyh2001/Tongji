@@ -46,7 +46,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-points", type=int, default=16384)
     parser.add_argument(
         "--decoder",
-        choices=["direct", "coarse_to_fine", "coarse_to_fine_tangent", "dmc_dpsr"],
+        choices=[
+            "direct",
+            "coarse_to_fine",
+            "coarse_to_fine_tangent",
+            "dmc_dpsr",
+            "dmc_dpsr_m1",
+            "dmc_dpsr_m2",
+            "dmc_dpsr_m3",
+        ],
         default="direct",
     )
     parser.add_argument("--coarse-points", type=int, default=8192)
@@ -67,6 +75,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dmc-queries", type=int, default=256)
     parser.add_argument("--dmc-fold-step", type=int, default=8)
     parser.add_argument("--dmc-transformer-layers", type=int, default=3)
+    parser.add_argument("--margin-anchor-queries", type=int, default=64)
+    parser.add_argument("--ring-groups", type=int, default=6)
+    parser.add_argument("--margin-anchor-weight", type=float, default=0.5)
+    parser.add_argument("--margin-risk-weight", type=float, default=0.5)
+    parser.add_argument("--margin-risk-alpha", type=float, default=3.0)
+    parser.add_argument("--margin-risk-sigma-mm", type=float, default=1.0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -131,7 +145,9 @@ def main() -> None:
 
 
 def build_model(args: argparse.Namespace) -> torch.nn.Module:
-    if args.decoder == "dmc_dpsr":
+    if args.decoder.startswith("dmc_dpsr"):
+        use_margin = args.decoder != "dmc_dpsr"
+        use_anchor = args.decoder in {"dmc_dpsr_m2", "dmc_dpsr_m3"}
         return M0DMCDPSRNet(
             model_dim=args.dmc_model_dim,
             context_tokens_per_input=args.dmc_context_tokens,
@@ -141,6 +157,9 @@ def build_model(args: argparse.Namespace) -> torch.nn.Module:
             dpsr_resolution=args.dpsr_resolution,
             dpsr_sigma=args.dpsr_sigma,
             roi_half_extent_mm=args.roi_half_extent_mm,
+            use_margin=use_margin,
+            margin_anchor_queries=args.margin_anchor_queries if use_anchor else 0,
+            ring_groups=args.ring_groups if use_anchor else 0,
         )
     if args.decoder == "coarse_to_fine_tangent":
         return M0TangentCoarseToFineNet(
@@ -165,13 +184,15 @@ def run_epoch(
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
-    if args.decoder == "dmc_dpsr":
+    if args.decoder.startswith("dmc_dpsr"):
         sums = {
             "loss": 0.0,
             "chamfer": 0.0,
             "normal": 0.0,
             "grid_mse": 0.0,
             "grid_l1": 0.0,
+            "margin_anchor": 0.0,
+            "margin_risk": 0.0,
         }
     elif args.decoder == "coarse_to_fine_tangent":
         sums = {
@@ -205,16 +226,18 @@ def run_epoch(
         prep = batch["prep"].to(args.device, non_blocking=True)
         antagonist = batch["antagonist"].to(args.device, non_blocking=True)
         crown = batch["crown"].to(args.device, non_blocking=True)
+        margin = batch["margin"].to(args.device, non_blocking=True)
         tooth_index = batch["tooth_index"].to(args.device, non_blocking=True)
         prep_arch_index = batch["prep_arch_index"].to(args.device, non_blocking=True)
 
         with torch.set_grad_enabled(training):
-            if args.decoder == "dmc_dpsr":
+            if args.decoder.startswith("dmc_dpsr"):
                 outputs = model(
                     prep,
                     antagonist,
                     tooth_index,
                     prep_arch_index,
+                    margin=margin if model.use_margin else None,
                     return_grid=True,
                 )
                 with torch.no_grad():
@@ -227,6 +250,17 @@ def run_epoch(
                     chamfer_points=args.chamfer_points,
                     normal_weight=args.normal_weight,
                     grid_weight=args.grid_weight,
+                    margin=margin if model.use_margin else None,
+                    margin_anchor_weight=(
+                        args.margin_anchor_weight
+                        if args.decoder in {"dmc_dpsr_m2", "dmc_dpsr_m3"}
+                        else 0.0
+                    ),
+                    margin_risk_weight=(
+                        args.margin_risk_weight if args.decoder == "dmc_dpsr_m3" else 0.0
+                    ),
+                    margin_risk_alpha=args.margin_risk_alpha,
+                    margin_risk_sigma_mm=args.margin_risk_sigma_mm,
                 )
             elif args.decoder == "coarse_to_fine_tangent":
                 outputs = model(

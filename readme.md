@@ -709,53 +709,50 @@ result/YYYYMMDD/m0_tangent_c2f64k/
 1. `test/metrics_by_case.csv` 必须包含逐病例指标。
 2. `test/summary_metrics.csv/json` 必须包含汇总指标。
 3. 每个样本的 GT STL、预测点云和预测 STL 必须放在同一个 `cases/<case_id>/` 文件夹内。
-4. 后续点云版 M0-M3 统一使用相同的 coarse-to-fine 输出密度和 STL 重建参数。
+4. 后续 M0-M3 统一使用相同的 DMC-DPSR 输出和 STL 生成参数。
 5. `result/` 是生成结果目录，默认不提交到 Git。
 
 ### 统一 STL 生成规则
 
-后续正式点云版 M0-M3 统一采用高密度预测点云和固定的清理/重建流程：
+2026-07-28 起，后续正式 M0-M3 统一采用训练内的隐式表面监督和固定 STL 导出流程：
 
 ```text
-model predicts 65536 tangent-constrained points
--> statistical outlier removal
--> 0.08 mm voxel consolidation
--> normal-guided MLS projection
--> Screened Poisson reconstruction
--> remove low-density vertices
+model predicts 16384 oriented points with Transformer + Folding
+-> differentiable Poisson reconstruction
+-> 128^3 indicator grid
+-> zero-level Marching Cubes
 -> keep largest connected component
--> simplify to at most 50000 triangles
--> Taubin smoothing
+-> at most 5 Taubin smoothing iterations
 -> export STL
 ```
 
 也就是：
 
 ```text
-official_stl_method = tangent_mls_poisson
+official_stl_method = dmc_dpsr_marching_cubes
+grid_weight = 100
+dpsr_resolution = 128
+roi_half_extent_mm = 12
 ```
 
 M0-M3 的实验差别仍只体现在输入、网络模块和 loss，STL 参数保持一致：
 
 ```text
-M0: prep + antagonist + tooth/arch -> tangent coarse-to-fine 64k points
-M1: M0 + margin line input -> tangent coarse-to-fine 64k points
-M2: M1 + margin-line anchored / ring-wise module -> tangent coarse-to-fine 64k points
-M3: M2 + margin/risk-weighted loss -> tangent coarse-to-fine 64k points
+M0: prep + antagonist + tooth/arch -> DMC-DPSR
+M1: M0 + margin line context tokens -> DMC-DPSR
+M2: M1 + 64 margin-anchored queries + 6 ring query groups -> DMC-DPSR
+M3: M2 + margin risk-weighted Chamfer -> DMC-DPSR
 ```
 
 正式 M0 评估命令：
 
 ```bash
 python3 scripts/run_m0_official_experiment.py \
-  --checkpoint runs/m0_tangent_c2f64k/best.pt \
+  --checkpoint runs/m0_dmc_dpsr128_grid100/best.pt \
   --date YYYYMMDD \
-  --experiment-name m0_tangent_c2f64k \
-  --stl-method tangent_mls_poisson \
-  --poisson-depth 8 \
-  --poisson-threads 8 \
-  --mls-iterations 2 \
-  --smooth-iterations 10
+  --experiment-name m0_dmc_dpsr128_grid100 \
+  --stl-method dmc_dpsr_marching_cubes \
+  --smooth-iterations 5
 ```
 
 旧的 direct 16k/32k/64k MLP、无切平面约束 coarse-to-fine、dynamic template deformation 和 `alpha_clean_taubin` 结果保留为方法消融，不作为当前正式 M0 输出。增加输出点数必须由模型的切平面局部展开层学习，禁止把低密度预测点云机械插值后冒充高密度模型输出。
@@ -826,6 +823,48 @@ python3 scripts/run_m0_official_experiment.py \
 作为参照，之前 `m0_tangent_c2f64k` 的 STL symmetric RMS 约为 0.638 mm。DMC-DPSR 的高网格权重版本在 STL 指标上更优，并显著减少点云后处理产生的尖刺、坑洼和碎面，因此后续 DMC-DPSR 实验默认使用 `grid_weight=100`。
 
 当前限制：预测冠仍存在病例特异性细节不足，最差病例容易趋向平均牙形。该问题不能继续靠 STL 后处理解决，后续应优先改进输入上下文、margin line、局部特征编码和区域风险损失。
+
+### M1-M3 统一实验命令
+
+三组只修改 `--decoder` 和对应的 margin 模块，其他训练参数、数据 split 和 STL 导出参数保持一致：
+
+```bash
+# M1: margin line input
+python3 scripts/train_m0.py --decoder dmc_dpsr_m1 \
+  --split-file splits/m0_patient_split_seed20260706.json \
+  --output-dir runs/m1_dmc_dpsr128_grid100 \
+  --epochs 60 --batch-size 16 --grid-weight 100
+
+# M2: M1 + margin anchors + ring query groups
+python3 scripts/train_m0.py --decoder dmc_dpsr_m2 \
+  --split-file splits/m0_patient_split_seed20260706.json \
+  --output-dir runs/m2_mla_dmc_dpsr128_grid100 \
+  --epochs 60 --batch-size 16 --grid-weight 100 \
+  --margin-anchor-queries 64 --ring-groups 6 \
+  --margin-anchor-weight 0.5
+
+# M3: M2 + margin risk-weighted loss
+python3 scripts/train_m0.py --decoder dmc_dpsr_m3 \
+  --split-file splits/m0_patient_split_seed20260706.json \
+  --output-dir runs/m3_risk_dmc_dpsr128_grid100 \
+  --epochs 60 --batch-size 16 --grid-weight 100 \
+  --margin-anchor-queries 64 --ring-groups 6 \
+  --margin-anchor-weight 0.5 --margin-risk-weight 0.5 \
+  --margin-risk-alpha 3.0 --margin-risk-sigma-mm 1.0
+```
+
+评估统一使用：
+
+```bash
+python3 scripts/run_m0_official_experiment.py \
+  --checkpoint runs/<experiment>/best.pt \
+  --date YYYYMMDD \
+  --experiment-name <experiment> \
+  --stl-method dmc_dpsr_marching_cubes \
+  --smooth-iterations 5
+```
+
+除整体 point/STL RMS 与 HD95 外，评估脚本同时汇总 `margin_point_*`、`margin_stl_*`、`r1_point_*` 和 `r1_stl_*` 指标。
 
 参考实现和论文：
 

@@ -40,7 +40,10 @@ def main() -> None:
 
     checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
     checkpoint_args = checkpoint.get("args", {})
-    if checkpoint_args.get("decoder") == "dmc_dpsr":
+    decoder = str(checkpoint_args.get("decoder", "direct"))
+    if decoder.startswith("dmc_dpsr"):
+        use_margin = decoder != "dmc_dpsr"
+        use_anchor = decoder in {"dmc_dpsr_m2", "dmc_dpsr_m3"}
         model = M0DMCDPSRNet(
             model_dim=int(checkpoint_args.get("dmc_model_dim", 256)),
             context_tokens_per_input=int(checkpoint_args.get("dmc_context_tokens", 256)),
@@ -50,8 +53,13 @@ def main() -> None:
             dpsr_resolution=int(checkpoint_args.get("dpsr_resolution", 128)),
             dpsr_sigma=float(checkpoint_args.get("dpsr_sigma", 2.0)),
             roi_half_extent_mm=float(checkpoint_args.get("roi_half_extent_mm", 12.0)),
+            use_margin=use_margin,
+            margin_anchor_queries=(
+                int(checkpoint_args.get("margin_anchor_queries", 64)) if use_anchor else 0
+            ),
+            ring_groups=int(checkpoint_args.get("ring_groups", 6)) if use_anchor else 0,
         ).to(args.device)
-    elif checkpoint_args.get("decoder") == "coarse_to_fine_tangent":
+    elif decoder == "coarse_to_fine_tangent":
         model = M0TangentCoarseToFineNet(
             coarse_points=int(checkpoint_args.get("coarse_points", 8192)),
             first_factor=int(checkpoint_args.get("first_factor", 4)),
@@ -70,11 +78,15 @@ def main() -> None:
 
     with torch.no_grad():
         for batch in loader:
+            model_kwargs = {}
+            if isinstance(model, M0DMCDPSRNet) and model.use_margin:
+                model_kwargs["margin"] = batch["margin"].to(args.device)
             pred = model(
                 batch["prep"].to(args.device),
                 batch["antagonist"].to(args.device),
                 batch["tooth_index"].to(args.device),
                 batch["prep_arch_index"].to(args.device),
+                **model_kwargs,
             )
             pred_np = pred.cpu().numpy()
             for i, case_id in enumerate(batch["case_id"]):

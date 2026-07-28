@@ -101,7 +101,10 @@ def main() -> None:
 def load_model(args: argparse.Namespace) -> torch.nn.Module:
     checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
     checkpoint_args = checkpoint.get("args", {})
-    if checkpoint_args.get("decoder") == "dmc_dpsr":
+    decoder = str(checkpoint_args.get("decoder", "direct"))
+    if decoder.startswith("dmc_dpsr"):
+        use_margin = decoder != "dmc_dpsr"
+        use_anchor = decoder in {"dmc_dpsr_m2", "dmc_dpsr_m3"}
         model = M0DMCDPSRNet(
             model_dim=int(checkpoint_args.get("dmc_model_dim", 256)),
             context_tokens_per_input=int(checkpoint_args.get("dmc_context_tokens", 256)),
@@ -111,8 +114,13 @@ def load_model(args: argparse.Namespace) -> torch.nn.Module:
             dpsr_resolution=int(checkpoint_args.get("dpsr_resolution", 128)),
             dpsr_sigma=float(checkpoint_args.get("dpsr_sigma", 2.0)),
             roi_half_extent_mm=float(checkpoint_args.get("roi_half_extent_mm", 12.0)),
+            use_margin=use_margin,
+            margin_anchor_queries=(
+                int(checkpoint_args.get("margin_anchor_queries", 64)) if use_anchor else 0
+            ),
+            ring_groups=int(checkpoint_args.get("ring_groups", 6)) if use_anchor else 0,
         ).to(args.device)
-    elif checkpoint_args.get("decoder") == "coarse_to_fine_tangent":
+    elif decoder == "coarse_to_fine_tangent":
         model = M0TangentCoarseToFineNet(
             coarse_points=int(checkpoint_args.get("coarse_points", 8192)),
             first_factor=int(checkpoint_args.get("first_factor", 4)),
@@ -160,7 +168,11 @@ def run_sample_set(
                 batch["prep_arch_index"].to(args.device),
             )
             if isinstance(model, M0DMCDPSRNet):
-                outputs = model(*model_args, return_grid=True)
+                outputs = model(
+                    *model_args,
+                    margin=batch["margin"].to(args.device) if model.use_margin else None,
+                    return_grid=True,
+                )
                 pred = outputs["points"].cpu().numpy()
                 pred_grids = outputs["psr_grid"].cpu().numpy()
             else:
@@ -175,6 +187,7 @@ def run_sample_set(
                     crown[i].astype(np.float32),
                     sample_dir,
                     args,
+                    margin_local=batch["margin"][i].cpu().numpy().astype(np.float32),
                     pred_grid=None if pred_grids[i] is None else pred_grids[i].astype(np.float32),
                 )
                 rows.append(row)
@@ -188,6 +201,7 @@ def evaluate_case(
     sample_dir: Path,
     args: argparse.Namespace,
     *,
+    margin_local: np.ndarray,
     pred_grid: np.ndarray | None = None,
 ) -> dict:
     stem = safe_case_name(case_path, args.data_dir)
@@ -208,6 +222,23 @@ def evaluate_case(
         write_ply(pred_ply, pred_local)
 
         row.update(prefix_metrics("point", point_metrics(pred_local[:, :3], gt_local[:, :3])))
+        row.update(
+            prefix_metrics(
+                "margin_point",
+                margin_distance_metrics(margin_local[:, :3], pred_local[:, :3]),
+            )
+        )
+        row.update(
+            prefix_metrics(
+                "r1_point",
+                regional_surface_metrics(
+                    pred_local[:, :3],
+                    gt_local[:, :3],
+                    margin_local[:, :3],
+                    radius_mm=1.0,
+                ),
+            )
+        )
 
         pred_original = restore_original_coordinates(pred_local, case_path)
         if args.stl_method == "dmc_dpsr_marching_cubes":
@@ -245,11 +276,31 @@ def evaluate_case(
             raise FileNotFoundError(f"missing GT STL for {case_path}")
         shutil.copy2(gt_stl, gt_stl_copy)
         gt_mesh = read_mesh(gt_stl)
-        stl_metrics = surface_metrics(
-            sample_mesh_points(pred_mesh, args.sample_points),
-            sample_mesh_points(gt_mesh, args.sample_points),
-        )
+        pred_surface = sample_mesh_points(pred_mesh, args.sample_points)
+        gt_surface = sample_mesh_points(gt_mesh, args.sample_points)
+        stl_metrics = surface_metrics(pred_surface, gt_surface)
         row.update(prefix_metrics("stl", stl_metrics))
+        margin_original = restore_original_coordinates(
+            np.pad(margin_local, ((0, 0), (0, 3))),
+            case_path,
+        )[:, :3]
+        row.update(
+            prefix_metrics(
+                "margin_stl",
+                margin_distance_metrics(margin_original, pred_surface),
+            )
+        )
+        row.update(
+            prefix_metrics(
+                "r1_stl",
+                regional_surface_metrics(
+                    pred_surface,
+                    gt_surface,
+                    margin_original,
+                    radius_mm=1.0,
+                ),
+            )
+        )
         row.update(mesh_stats(pred_mesh))
         row.update(
             {
@@ -524,6 +575,43 @@ def surface_metrics(pred_xyz: np.ndarray, gt_xyz: np.ndarray) -> dict[str, float
     }
 
 
+def margin_distance_metrics(
+    margin_xyz: np.ndarray,
+    surface_xyz: np.ndarray,
+) -> dict[str, float]:
+    distances, _ = cKDTree(surface_xyz).query(margin_xyz, k=1)
+    return {
+        "mean": mean(distances),
+        "rms": rms(distances),
+        "hd95": percentile(distances, 95),
+    }
+
+
+def regional_surface_metrics(
+    pred_xyz: np.ndarray,
+    gt_xyz: np.ndarray,
+    margin_xyz: np.ndarray,
+    *,
+    radius_mm: float,
+) -> dict[str, float]:
+    pred_distance, _ = cKDTree(margin_xyz).query(pred_xyz, k=1)
+    gt_distance, _ = cKDTree(margin_xyz).query(gt_xyz, k=1)
+    pred_region = pred_xyz[pred_distance <= radius_mm]
+    gt_region = gt_xyz[gt_distance <= radius_mm]
+    if len(pred_region) < 10 or len(gt_region) < 10:
+        return {
+            "pred_to_gt_mean": float("nan"),
+            "pred_to_gt_rms": float("nan"),
+            "pred_to_gt_hd95": float("nan"),
+            "gt_to_pred_mean": float("nan"),
+            "gt_to_pred_rms": float("nan"),
+            "gt_to_pred_hd95": float("nan"),
+            "symmetric_mean": float("nan"),
+            "symmetric_rms": float("nan"),
+        }
+    return surface_metrics(pred_region, gt_region)
+
+
 def mesh_stats(mesh: o3d.geometry.TriangleMesh) -> dict:
     labels, counts, _ = mesh.cluster_connected_triangles()
     counts_np = np.asarray(counts)
@@ -564,6 +652,18 @@ def summarize_rows(rows: list[dict]) -> dict[str, dict]:
         "stl_symmetric_rms",
         "stl_pred_to_gt_hd95",
         "stl_gt_to_pred_hd95",
+        "margin_point_mean",
+        "margin_point_rms",
+        "margin_point_hd95",
+        "r1_point_symmetric_rms",
+        "r1_point_pred_to_gt_hd95",
+        "r1_point_gt_to_pred_hd95",
+        "margin_stl_mean",
+        "margin_stl_rms",
+        "margin_stl_hd95",
+        "r1_stl_symmetric_rms",
+        "r1_stl_pred_to_gt_hd95",
+        "r1_stl_gt_to_pred_hd95",
         "triangles",
         "surface_area",
     ]
@@ -573,6 +673,7 @@ def summarize_rows(rows: list[dict]) -> dict[str, dict]:
     item = summary[method]
     for key in metric_keys:
         values = np.asarray([float(row[key]) for row in ok_rows if row.get(key) not in ("", None)], dtype=float)
+        values = values[np.isfinite(values)]
         if values.size:
             item[f"{key}_mean"] = float(np.mean(values))
             item[f"{key}_median"] = float(np.median(values))
