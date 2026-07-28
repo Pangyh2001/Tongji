@@ -627,9 +627,9 @@ def mesh_stats(mesh: o3d.geometry.TriangleMesh) -> dict:
         ),
         axis=1,
     )
-    unique_edges = np.unique(edges, axis=0)
+    unique_edges, edge_counts = np.unique(edges, axis=0, return_counts=True)
     euler_characteristic = int(len(mesh.vertices) - len(unique_edges) + len(triangles))
-    watertight = bool(mesh.is_watertight())
+    watertight = bool(np.all(edge_counts == 2))
     genus = float((2 - euler_characteristic) / 2) if watertight else float("nan")
     return {
         "vertices": int(len(mesh.vertices)),
