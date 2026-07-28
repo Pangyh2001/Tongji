@@ -866,7 +866,37 @@ python3 scripts/run_m0_official_experiment.py \
 
 除整体 point/STL RMS 与 HD95 外，评估脚本同时汇总 `margin_point_*`、`margin_stl_*`、`r1_point_*` 和 `r1_stl_*` 指标。
 
-### M0-M3 首轮结果（2026-07-28）
+### 当前 STL 生成方法
+
+M0-M3 当前统一使用同一套 STL 生成方法，实验差异只来自输入、网络模块和 loss：
+
+```text
+prep / antagonist / optional margin
+-> Transformer context encoder and query decoder
+-> Folding decoder
+-> 16384 oriented points (x, y, z, nx, ny, nz)
+-> differentiable Poisson surface reconstruction during training
+-> 128^3 predicted indicator grid
+-> zero-level Marching Cubes
+-> keep largest connected component
+-> at most 5 Taubin smoothing iterations
+-> STL
+```
+
+固定参数：
+
+```text
+dpsr_resolution = 128
+dpsr_sigma = 2.0
+roi_half_extent_mm = 12.0
+grid_weight = 100
+stl_method = dmc_dpsr_marching_cubes
+marching_cubes_level = 0.0
+```
+
+STL 直接来自模型训练过的 DPSR 隐式指示场，不再对预测点云运行 alpha-shape、MLS 或 Open3D Poisson。每个病例同时保存预测定向点、`pred_psr_grid.npy` 和最终 STL，便于复核零水平集。
+
+### M0-M3 Baseline 汇总（2026-07-28）
 
 固定 test split 70 例，四组均使用 `128^3 DPSR + grid_weight=100 + Marching Cubes`：
 
@@ -877,6 +907,15 @@ python3 scripts/run_m0_official_experiment.py \
 | M2 | 0.358 | 0.521 | **0.084** | 0.219 | 1.052 | **7/70** |
 | M3 | **0.348** | 0.508 | 0.090 | **0.209** | **0.768** | 11/70 |
 
+更完整的结果：
+
+| 方法 | 方案变量 | 最佳 epoch | STL RMS | margin STL RMS | topology ok |
+|---|---|---:|---:|---:|---:|
+| M0 | prep + antagonist + tooth/arch | 59 | 0.558 | 1.203 | 50/70 (71.4%) |
+| M1 | M0 + margin context tokens | 58 | **0.494** | 0.962 | 59/70 (84.3%) |
+| M2 | M1 + 64 margin anchors + 6 ring groups | 56 | 0.521 | 0.978 | **63/70 (90.0%)** |
+| M3 | M2 + margin risk-weighted loss | 60 | 0.508 | **0.860** | 59/70 (84.3%) |
+
 结论：
 
 - M1 的整体 STL 几何误差最低。
@@ -884,6 +923,51 @@ python3 scripts/run_m0_official_experiment.py \
 - M3 的整体点云、R1 点云和 R1 STL 指标最好。
 - `edge_manifold=True` 不能发现封闭贯穿孔，因此正式评价必须同时报告 `watertight`、Euler characteristic、`genus` 和 `topology_ok`。
 - 当前 M2 是更稳妥的 STL 候选；M3 需要加入拓扑约束后再判断是否作为完整模型。
+
+完整机器可读汇总：
+
+```text
+result/20260728/m0_m3_dmc_dpsr_comparison.csv
+result/20260728/m0_m3_dmc_dpsr_comparison.json
+result/20260728/m0_m3_topology_failures.csv
+result/20260728/m0_m3_stl_comparison.png
+```
+
+### 统一 10 病例 STL 对比集
+
+从 70 个 test 病例按 M0-M3 平均 STL symmetric RMS 排序，在 10 个等距排名位置选样，避免只展示效果好的病例：
+
+```text
+07266吴嘉雯Z_15
+05797赵娟Z_26
+53237芦重香Z_16
+06045黄凤婷W_36
+30724赵丹丽0_27
+05822马国梁0_27
+50039周艳W_25
+11935王_45
+53351余新爱W_37
+05801赵俊Z_46
+```
+
+每个病例包含：
+
+```text
+<case>__GT.stl
+<case>__M0_pred.stl
+<case>__M1_pred.stl
+<case>__M2_pred.stl
+<case>__M3_pred.stl
+```
+
+服务器目录和压缩包：
+
+```text
+result/20260728/m0_m3_representative10/
+result/20260728/m0_m3_representative10.zip
+```
+
+`selection_manifest.csv` 记录选样排名及四组 STL RMS、genus、`topology_ok`；`metrics_by_sample_and_method.csv` 保存四组逐病例完整指标。
 
 参考实现和论文：
 
