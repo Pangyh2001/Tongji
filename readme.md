@@ -1094,3 +1094,45 @@ result/20260728/m0_m3_representative10.zip
 - DCrownFormer: <https://papers.miccai.org/miccai-2024/194-Paper0638.html>
 - Shape As Points / DPSR: <https://papers.nips.cc/paper/2021/hash/6cd9313ed34ef58bad3fdd504355e72c-Abstract.html>
 - FoldingNet: <https://arxiv.org/abs/1712.07262>
+
+## DPSR 改进实验结果（2026-07-29）
+
+以下实验以原 M2 最优 checkpoint 为起点进行 30 epoch 微调。物理 batch 为 1，
+梯度累积为 16，并冻结 Folding decoder 的 BatchNorm running statistics。
+每个实验都保留原始零水平面 STL；`balanced_iso` 是不使用 GT 的动态等值面版本。
+
+| 实验 | STL 版本 | STL RMS | STL F-score | Margin STL RMS | R1 STL RMS | topology ok |
+|---|---|---:|---:|---:|---:|---:|
+| M2 baseline | level=0 | 0.521 | 0.421 | 0.977 | 1.056 | 63/70 |
+| M2 + E0 | balanced iso | 0.522 | 0.430 | 0.563 | 0.400 | 70/70 |
+| E1 margin-zero | level=0 | 0.460 | 0.488 | 0.272 | 0.288 | 11/70 |
+| E1 margin-zero | balanced iso | 0.478 | 0.464 | 0.232 | 0.352 | 70/70 |
+| E2 detail | level=0 | 0.402 | 0.566 | 0.314 | 0.336 | 23/70 |
+| **E2 detail** | **balanced iso** | **0.413** | **0.551** | **0.216** | **0.285** | **70/70** |
+| E3 soft topology | level=0 | 0.460 | 0.496 | 0.240 | 0.294 | 19/70 |
+| E3 soft topology | balanced iso | 0.510 | 0.438 | 0.264 | 0.380 | 68/70 |
+| E4 combined | level=0 | **0.401** | 0.564 | 0.236 | **0.277** | 32/70 |
+| E4 combined | balanced iso | 0.415 | 0.544 | **0.189** | 0.281 | 69/70 |
+
+结论：
+
+- 单独调整 iso-level 已能让原 M0-M3 的拓扑达到 70/70，同时基本保持整体误差。
+- `margin-zero loss` 明显改善颈缘，但固定 level=0 会产生大量隧道，必须配合拓扑安全导出。
+- `sigma=1 + narrow-band + multi-scale + grid-gradient` 对整体 STL 和细节指标最有效。
+- 当前软 Euler loss 只能降低部分拓扑风险，不能代替硬性 watertight/genus QC。
+- 当前推荐结果为 `E2 detail + balanced iso`，因为它是唯一同时达到 70/70
+  topology ok、较低整体 STL RMS 和较低颈缘误差的方案。
+- E4 的 level=0 整体 RMS 最低，但 balanced iso 仍有 1 例失败，因此暂不作为默认方案。
+- 这些指标仍不包含咬合接触、邻接接触和内表面适合度，不能直接视为可加工牙冠。
+
+完整结果：
+
+```text
+result/20260729/dpsr_improvement_summary.csv
+result/20260729/dpsr_improvement_summary.json
+result/20260729/README.md
+result/20260729/e2_m2_detail/test/cases/
+result/20260729/e2b_m2_detail_iso_balanced/test/cases/
+```
+
+每个 `test/cases/<case>/` 均保存对应病例的 GT STL 和预测 STL。
