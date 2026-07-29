@@ -14,7 +14,12 @@ from torch.utils.data import DataLoader
 
 from src.crown_m0.dataset import CrownDataset, discover_cases
 from src.crown_m0.io import write_ply, write_xyz
-from src.crown_m0.model import M0CrownNet
+from src.crown_m0.model import (
+    M0CoarseToFineNet,
+    M0CrownNet,
+    M0DMCDPSRNet,
+    M0TangentCoarseToFineNet,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,17 +39,54 @@ def main() -> None:
     loader = DataLoader(CrownDataset(records), batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
-    model = M0CrownNet().to(args.device)
+    checkpoint_args = checkpoint.get("args", {})
+    decoder = str(checkpoint_args.get("decoder", "direct"))
+    if decoder.startswith("dmc_dpsr"):
+        use_margin = decoder != "dmc_dpsr"
+        use_anchor = decoder in {"dmc_dpsr_m2", "dmc_dpsr_m3"}
+        model = M0DMCDPSRNet(
+            model_dim=int(checkpoint_args.get("dmc_model_dim", 256)),
+            context_tokens_per_input=int(checkpoint_args.get("dmc_context_tokens", 256)),
+            num_queries=int(checkpoint_args.get("dmc_queries", 256)),
+            fold_step=int(checkpoint_args.get("dmc_fold_step", 8)),
+            transformer_layers=int(checkpoint_args.get("dmc_transformer_layers", 3)),
+            dpsr_resolution=int(checkpoint_args.get("dpsr_resolution", 128)),
+            dpsr_sigma=float(checkpoint_args.get("dpsr_sigma", 2.0)),
+            roi_half_extent_mm=float(checkpoint_args.get("roi_half_extent_mm", 12.0)),
+            use_margin=use_margin,
+            margin_anchor_queries=(
+                int(checkpoint_args.get("margin_anchor_queries", 64)) if use_anchor else 0
+            ),
+            ring_groups=int(checkpoint_args.get("ring_groups", 6)) if use_anchor else 0,
+        ).to(args.device)
+    elif decoder == "coarse_to_fine_tangent":
+        model = M0TangentCoarseToFineNet(
+            coarse_points=int(checkpoint_args.get("coarse_points", 8192)),
+            first_factor=int(checkpoint_args.get("first_factor", 4)),
+            second_factor=int(checkpoint_args.get("second_factor", 2)),
+        ).to(args.device)
+    elif checkpoint_args.get("decoder") == "coarse_to_fine":
+        model = M0CoarseToFineNet(
+            coarse_points=int(checkpoint_args.get("coarse_points", 8192)),
+            first_factor=int(checkpoint_args.get("first_factor", 4)),
+            second_factor=int(checkpoint_args.get("second_factor", 2)),
+        ).to(args.device)
+    else:
+        model = M0CrownNet(output_points=int(checkpoint_args.get("output_points", 16384))).to(args.device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
     with torch.no_grad():
         for batch in loader:
+            model_kwargs = {}
+            if isinstance(model, M0DMCDPSRNet) and model.use_margin:
+                model_kwargs["margin"] = batch["margin"].to(args.device)
             pred = model(
                 batch["prep"].to(args.device),
                 batch["antagonist"].to(args.device),
                 batch["tooth_index"].to(args.device),
                 batch["prep_arch_index"].to(args.device),
+                **model_kwargs,
             )
             pred_np = pred.cpu().numpy()
             for i, case_id in enumerate(batch["case_id"]):

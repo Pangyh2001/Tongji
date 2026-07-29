@@ -532,18 +532,22 @@ M0 的定义：
 
 - 输入：`prep_points.npy`、`antagonist_points.npy`、牙位编码、预备体颌位编码。
 - 不输入：`margin_points.npy`。
-- 输出：`16384 x 6` 的 AI 冠外表面点云，包含坐标和法向量。
-- 损失：采样 Chamfer Distance + 可选 normal cosine loss。
+- 输出：tangent coarse-to-fine 解码器逐级生成 `8192 -> 32768 -> 65536` 点的 AI 冠外表面点云，每点包含坐标和法向量。
+- 损失：三级 Chamfer/normal/point-to-plane 监督 + tangent sibling repulsion + point uniformity + local-plane consistency + normal-drift regularization。
 
-M0 当前采用 PointNet 风格上下文编码器作为可复现 baseline：
+M0 保留原始 direct MLP decoder 作为历史消融；正式高密度点云实验采用共享参数的 coarse-to-fine decoder：
 
 ```text
 prep ROI point cloud -> PointNet encoder
 antagonist ROI point cloud -> PointNet encoder
 tooth_id -> embedding
 prep_arch -> embedding
-fused feature -> MLP decoder -> 16384 crown points
+fused feature -> learned coarse seeds -> 8192 coarse points
+8192 parent points -> 4 tangent-plane offsets per parent -> 32768 points
+32768 parent points -> 2 tangent-plane offsets per parent -> 65536 points
 ```
+
+上采样点是模型根据病例上下文学习的局部偏移，不是对 16384 点预测结果做随机插值。每个子点主要沿父点的局部切平面展开，第一层/第二层法向偏移分别限制在 `0.02 mm`/`0.01 mm`，避免高密度点云形成有厚度的点层并在 STL 中产生尖刺。
 
 ### 安装依赖
 
@@ -620,23 +624,31 @@ test:   70 cases
 python3 scripts/train_m0.py \
   --data-dir data \
   --split-file splits/m0_patient_split_seed20260706.json \
-  --output-dir runs/m0 \
-  --epochs 100 \
-  --batch-size 2 \
-  --chamfer-points 2048
+  --output-dir runs/m0_tangent_c2f64k \
+  --decoder coarse_to_fine_tangent \
+  --coarse-points 8192 \
+  --first-factor 4 \
+  --second-factor 2 \
+  --epochs 60 \
+  --batch-size 4 \
+  --chamfer-points 8192 \
+  --normal-weight 0.20 \
+  --point-to-plane-weight 0.50 \
+  --local-plane-weight 0.20 \
+  --normal-drift-weight 0.50
 ```
 
-训练脚本会按患者 ID 划分 train/val/test，避免同一患者多颗牙位跨集合泄漏。划分结果保存到：
+固定 split 已显式传入，训练脚本不会重新随机划分。划分结果保存到：
 
 ```text
-runs/m0/split.json
+runs/m0_tangent_c2f64k/split.json
 ```
 
 checkpoint 保存到：
 
 ```text
-runs/m0/latest.pt
-runs/m0/best.pt
+runs/m0_tangent_c2f64k/latest.pt
+runs/m0_tangent_c2f64k/best.pt
 ```
 
 ### 推理导出
@@ -665,10 +677,10 @@ python3 scripts/predict_m0.py \
 result/YYYYMMDD/<experiment_name>/
 ```
 
-例如 dynamic template deformation 版 M0 baseline 正式评估输出为：
+例如 coarse-to-fine 64k 点云版 M0 正式评估输出为：
 
 ```text
-result/20260727/m0_template/
+result/20260727/m0_tangent_c2f64k/
 ```
 
 正式实验默认只输出 test split，不再额外复制 `representative10/` STL 子集。若后续需要汇报用代表样本，只保存代表样本名单，或直接从 `test/cases/` 中挑选。
@@ -676,7 +688,7 @@ result/20260727/m0_template/
 目录结构：
 
 ```text
-result/YYYYMMDD/m0_template/
+result/YYYYMMDD/m0_tangent_c2f64k/
   config.json
   summary_by_sample_set.csv
   test/
@@ -685,11 +697,10 @@ result/YYYYMMDD/m0_template/
     summary_metrics.json
     cases/
       <case_id>/
-        <case_id>_pred_vertices.npy
-        <case_id>_pred_vertices.xyz
-        <case_id>_pred_vertices.ply
-        <case_id>_pred_template_displacement.stl
-        <case_id>_selected_template.stl
+        <case_id>_pred.npy
+        <case_id>_pred.xyz
+        <case_id>_pred.ply
+        <case_id>_pred_tangent_mls_poisson.stl
         <case_id>_GT_technician.stl
 ```
 
@@ -697,59 +708,385 @@ result/YYYYMMDD/m0_template/
 
 1. `test/metrics_by_case.csv` 必须包含逐病例指标。
 2. `test/summary_metrics.csv/json` 必须包含汇总指标。
-3. 每个样本的 GT STL、预测 STL 和动态检索到的模板 STL 必须放在同一个 `cases/<case_id>/` 文件夹内。
-4. 后续正式 M0-M3 的 STL 输出统一采用 `template_displacement`。
+3. 每个样本的 GT STL、预测点云和预测 STL 必须放在同一个 `cases/<case_id>/` 文件夹内。
+4. 后续 M0-M3 统一使用相同的 DMC-DPSR 输出和 STL 生成参数。
 5. `result/` 是生成结果目录，默认不提交到 Git。
 
 ### 统一 STL 生成规则
 
-后续正式 M0-M3 不再把“无拓扑点云 -> alpha-shape/Poisson -> STL”作为主 STL 输出路线，而统一改为动态模板变形：
+2026-07-28 起，后续正式 M0-M3 统一采用训练内的隐式表面监督和固定 STL 导出流程：
 
 ```text
-train split GT STL
--> 构建动态模板库
--> 每个 case 按 tooth_id、prep_arch 和 prep 几何特征检索最合适模板
--> 网络预测该模板每个 vertex 的 displacement
--> template_vertices + displacement
--> 沿用 selected_template_faces
--> 直接导出 STL
+model predicts 16384 oriented points with Transformer + Folding
+-> differentiable Poisson reconstruction
+-> 128^3 indicator grid
+-> zero-level Marching Cubes
+-> keep largest connected component
+-> at most 5 Taubin smoothing iterations
+-> export STL
 ```
 
 也就是：
 
 ```text
-official_stl_method = template_displacement
+official_stl_method = dmc_dpsr_marching_cubes
+grid_weight = 100
+dpsr_resolution = 128
+roi_half_extent_mm = 12
 ```
 
-这不是“每个模板单独做一次实验”。模板库只提供 case 级初始形态，同一个模型在一次训练中学习不同模板的 displacement。M0、M1、M2、M3 的区别应体现在输入、网络模块和 loss 上，而不是 STL 重建算法上：
+M0-M3 的实验差别仍只体现在输入、网络模块和 loss，STL 参数保持一致：
 
 ```text
-M0: dynamic template + prep + antagonist + tooth/arch -> template displacement
-M1: M0 + margin line input -> template displacement
-M2: M1 + margin-line anchored / ring-wise module -> template displacement
-M3: M2 + margin/risk-weighted loss -> template displacement
+M0: prep + antagonist + tooth/arch -> DMC-DPSR
+M1: M0 + margin line context tokens -> DMC-DPSR
+M2: M1 + 64 margin-anchored queries + 6 ring query groups -> DMC-DPSR
+M3: M2 + margin risk-weighted Chamfer -> DMC-DPSR
 ```
 
-当前新增的 dynamic template deformation baseline 使用：
+正式 M0 评估命令：
 
 ```bash
-python3 scripts/build_crown_template_library.py \
-  --output-dir templates/m0_dynamic_library_4096 \
-  --target-triangles 8192 \
-  --max-templates-per-group 6
-
-python3 scripts/train_m0_template.py \
-  --template-index templates/m0_dynamic_library_4096/template_index.json \
-  --output-dir runs/m0_template
-
-python3 scripts/run_m0_template_official_experiment.py \
-  --checkpoint runs/m0_template/best.pt \
-  --template-index templates/m0_dynamic_library_4096/template_index.json \
+python3 scripts/run_m0_official_experiment.py \
+  --checkpoint runs/m0_dmc_dpsr128_grid100/best.pt \
   --date YYYYMMDD \
-  --experiment-name m0_template
+  --experiment-name m0_dmc_dpsr128_grid100 \
+  --stl-method dmc_dpsr_marching_cubes \
+  --smooth-iterations 5
 ```
 
-旧的 `alpha_clean_taubin` 仍可作为点云 baseline 的兼容导出或 STL 后处理消融，但不作为后续正式 M0-M3 的主 STL 方法。单个全局模板也不作为正式方法，因为一个牙位的模板不能稳定覆盖全部后牙牙位。
+旧的 direct 16k/32k/64k MLP、无切平面约束 coarse-to-fine、dynamic template deformation 和 `alpha_clean_taubin` 结果保留为方法消融，不作为当前正式 M0 输出。增加输出点数必须由模型的切平面局部展开层学习，禁止把低密度预测点云机械插值后冒充高密度模型输出。
 
+## DMC-DPSR 文献复现实验（2026-07-28）
 
+前述 `tangent coarse-to-fine 64k + MLS/Poisson` 在数值指标上有所改善，但测试 STL 仍出现尖刺和坑洼，因此不再继续通过单纯增加点数解决表面问题。本轮新增独立实验 `m0_dmc_dpsr128`，按 DMC 和 Shape As Points 的核心路线实现：
 
+```text
+prep + antagonist + tooth/arch
+-> context point tokens
+-> Transformer encoder/decoder
+-> Folding 2D patches
+-> 16384 oriented surface points
+-> differentiable Poisson surface reconstruction (DPSR)
+-> 128^3 indicator grid
+-> zero-level Marching Cubes
+-> STL
+```
+
+训练目标为：
+
+```text
+loss = Chamfer(point) + normal_weight * normal_loss
+     + grid_weight * MSE(predicted_indicator, GT_indicator)
+```
+
+这里 STL 直接来自网络训练过的隐式指示场，不再对预测点云运行 alpha-shape、MLS 或 Open3D Poisson。GT 上限测试表明 `64^3` 对牙冠高度方向量化过粗，因此正式快速验证直接使用论文路线中的 `128^3` 网格。固定局部 ROI 为 `[-12, 12] mm`，覆盖当前数据中全部牙冠点。
+
+训练命令：
+
+```bash
+python3 scripts/train_m0.py \
+  --data-dir data \
+  --split-file splits/m0_patient_split_seed20260706.json \
+  --output-dir runs/m0_dmc_dpsr128_grid100 \
+  --decoder dmc_dpsr \
+  --dpsr-resolution 128 \
+  --dpsr-sigma 2.0 \
+  --grid-weight 100.0 \
+  --epochs 60 \
+  --batch-size 2 \
+  --chamfer-points 4096
+```
+
+评估命令：
+
+```bash
+python3 scripts/run_m0_official_experiment.py \
+  --checkpoint runs/m0_dmc_dpsr128_grid100/best.pt \
+  --date YYYYMMDD \
+  --experiment-name m0_dmc_dpsr128_grid100 \
+  --stl-method dmc_dpsr_marching_cubes \
+  --smooth-iterations 5
+```
+
+每个测试病例除 GT STL、预测点云和预测 STL 外，还保存 `<case_id>_pred_psr_grid.npy`，用于复核零水平集和重复导出。该实验在完整测试集的指标和 STL 人工检查完成前属于候选方法，不覆盖原始 M0 定义。
+
+### 2026-07-28 快速验证结果
+
+固定 test split 共 70 例，两组实验都成功生成 140 个 GT/预测 STL：
+
+| 实验 | grid weight | 点云 symmetric RMS | STL symmetric RMS | 视觉结果 |
+|---|---:|---:|---:|---|
+| `m0_dmc_dpsr128` | 1 | 0.363 mm | 0.703 mm | 连续、无明显尖刺，但过度平滑 |
+| `m0_dmc_dpsr128_grid100` | 100 | 0.382 mm | **0.558 mm** | 连续流形，窝沟和边缘转折更清楚 |
+
+作为参照，之前 `m0_tangent_c2f64k` 的 STL symmetric RMS 约为 0.638 mm。DMC-DPSR 的高网格权重版本在 STL 指标上更优，并显著减少点云后处理产生的尖刺、坑洼和碎面，因此后续 DMC-DPSR 实验默认使用 `grid_weight=100`。
+
+当前限制：预测冠仍存在病例特异性细节不足，最差病例容易趋向平均牙形。该问题不能继续靠 STL 后处理解决，后续应优先改进输入上下文、margin line、局部特征编码和区域风险损失。
+
+### M1-M3 统一实验命令
+
+三组只修改 `--decoder` 和对应的 margin 模块，其他训练参数、数据 split 和 STL 导出参数保持一致：
+
+```bash
+# M1: margin line input
+python3 scripts/train_m0.py --decoder dmc_dpsr_m1 \
+  --split-file splits/m0_patient_split_seed20260706.json \
+  --output-dir runs/m1_dmc_dpsr128_grid100 \
+  --epochs 60 --batch-size 16 --grid-weight 100
+
+# M2: M1 + margin anchors + ring query groups
+python3 scripts/train_m0.py --decoder dmc_dpsr_m2 \
+  --split-file splits/m0_patient_split_seed20260706.json \
+  --output-dir runs/m2_mla_dmc_dpsr128_grid100 \
+  --epochs 60 --batch-size 16 --grid-weight 100 \
+  --margin-anchor-queries 64 --ring-groups 6 \
+  --margin-anchor-weight 0.5
+
+# M3: M2 + margin risk-weighted loss
+python3 scripts/train_m0.py --decoder dmc_dpsr_m3 \
+  --split-file splits/m0_patient_split_seed20260706.json \
+  --output-dir runs/m3_risk_dmc_dpsr128_grid100 \
+  --epochs 60 --batch-size 16 --grid-weight 100 \
+  --margin-anchor-queries 64 --ring-groups 6 \
+  --margin-anchor-weight 0.5 --margin-risk-weight 0.5 \
+  --margin-risk-alpha 3.0 --margin-risk-sigma-mm 1.0
+```
+
+评估统一使用：
+
+```bash
+python3 scripts/run_m0_official_experiment.py \
+  --checkpoint runs/<experiment>/best.pt \
+  --date YYYYMMDD \
+  --experiment-name <experiment> \
+  --stl-method dmc_dpsr_marching_cubes \
+  --smooth-iterations 5
+```
+
+除整体 point/STL RMS 与 HD95 外，评估脚本同时汇总 `margin_point_*`、`margin_stl_*`、`r1_point_*` 和 `r1_stl_*` 指标。
+
+### 当前 STL 生成方法
+
+M0-M3 当前统一使用同一套 STL 生成方法，实验差异只来自输入、网络模块和 loss：
+
+```text
+prep / antagonist / optional margin
+-> Transformer context encoder and query decoder
+-> Folding decoder
+-> 16384 oriented points (x, y, z, nx, ny, nz)
+-> differentiable Poisson surface reconstruction during training
+-> 128^3 predicted indicator grid
+-> zero-level Marching Cubes
+-> keep largest connected component
+-> at most 5 Taubin smoothing iterations
+-> STL
+```
+
+固定参数：
+
+```text
+dpsr_resolution = 128
+dpsr_sigma = 2.0
+roi_half_extent_mm = 12.0
+grid_weight = 100
+stl_method = dmc_dpsr_marching_cubes
+marching_cubes_level = 0.0
+```
+
+STL 直接来自模型训练过的 DPSR 隐式指示场，不再对预测点云运行 alpha-shape、MLS 或 Open3D Poisson。每个病例同时保存预测定向点、`pred_psr_grid.npy` 和最终 STL，便于复核零水平集。
+
+### M0-M3 Baseline 汇总（2026-07-28）
+
+固定 test split 70 例，四组均使用 `128^3 DPSR + grid_weight=100 + Marching Cubes`：
+
+| 方法 | 点云 RMS | STL RMS | margin 点 RMS | R1 点 RMS | R1 STL RMS | genus>0 |
+|---|---:|---:|---:|---:|---:|---:|
+| M0 | 0.382 | 0.558 | 0.366 | 0.358 | 2.195 | 20/70 |
+| M1 | 0.358 | **0.494** | 0.268 | 0.262 | 1.210 | 11/70 |
+| M2 | 0.358 | 0.521 | **0.084** | 0.219 | 1.052 | **7/70** |
+| M3 | **0.348** | 0.508 | 0.090 | **0.209** | **0.768** | 11/70 |
+
+更完整的结果：
+
+| 方法 | 方案变量 | 最佳 epoch | STL RMS | margin STL RMS | topology ok |
+|---|---|---:|---:|---:|---:|
+| M0 | prep + antagonist + tooth/arch | 59 | 0.558 | 1.203 | 50/70 (71.4%) |
+| M1 | M0 + margin context tokens | 58 | **0.494** | 0.962 | 59/70 (84.3%) |
+| M2 | M1 + 64 margin anchors + 6 ring groups | 56 | 0.521 | 0.978 | **63/70 (90.0%)** |
+| M3 | M2 + margin risk-weighted loss | 60 | 0.508 | **0.860** | 59/70 (84.3%) |
+
+新增完整几何指标：
+
+| 方法 | Point F-score@0.3 | STL F-score@0.3 | Normal cosine | Normal error |
+|---|---:|---:|---:|---:|
+| M0 | 0.591 | 0.407 | 0.577 | 49.30 deg |
+| M1 | 0.640 | **0.453** | **0.646** | **44.06 deg** |
+| M2 | 0.649 | 0.421 | 0.466 | 57.51 deg |
+| M3 | **0.670** | 0.439 | 0.462 | 57.66 deg |
+
+结论：
+
+- M1 的整体 STL 几何误差最低。
+- M2 的 margin 点贴合和拓扑可靠性最好。
+- M3 的整体点云、R1 点云和 R1 STL 指标最好。
+- `edge_manifold=True` 不能发现封闭贯穿孔，因此正式评价必须同时报告 `watertight`、Euler characteristic、`genus` 和 `topology_ok`。
+- 当前 M2 是更稳妥的 STL 候选；M3 需要加入拓扑约束后再判断是否作为完整模型。
+
+完整机器可读汇总：
+
+```text
+result/20260728/m0_m3_dmc_dpsr_comparison.csv
+result/20260728/m0_m3_dmc_dpsr_comparison.json
+result/20260728/m0_m3_all_metrics_by_method.csv
+result/20260728/m0_m3_all_metrics_by_method.json
+result/20260728/m0_m3_all_metrics_transposed.csv
+result/20260728/m0_m3_topology_failures.csv
+result/20260728/m0_m3_stl_comparison.png
+```
+
+### 当前实际计算的评估指标
+
+以下指标已实际写入每个实验的 `test/metrics_by_case.csv`，并在 `summary_metrics.csv/json` 中统计 mean、median 和 max：
+
+1. 整体预测点云：
+   `pred_to_gt / gt_to_pred mean`、RMS、HD95、symmetric mean/RMS、precision、recall、F-score@0.3 mm、normal cosine similarity、normal angular error。
+2. 最终预测 STL：
+   `pred_to_gt / gt_to_pred mean`、RMS、HD95、symmetric mean/RMS、precision、recall、F-score@0.3 mm。
+3. Margin line：
+   margin 到预测点云和预测 STL 的 mean、RMS、HD95。
+4. R1 边缘区：
+   点云和 STL 的双向 mean、RMS、HD95、symmetric mean/RMS、F-score@0.3 mm。R1 定义为距 margin line 不超过 `1.0 mm` 的区域。
+5. 网格质量与拓扑：
+   vertices、triangles、components、largest component、surface area、edge/vertex manifold、watertight、Euler characteristic、genus、`topology_ok`。
+
+尚未进入本轮正式结果的计划指标：
+
+- R2-R5 分区指标
+- 咬合接触面积、穿透深度和接触位置误差
+- 邻接接触、邻接间隙和穿透
+- 内表面适合度、粘接间隙和预备体穿透
+- margin shortfall / overhang 独立分类
+- 专家盲评、临床可接受率和 CRCS
+
+这些指标不能从当前汇总表推断，需在完成区域标注、接触阈值和内外表面定义后单独实现。
+
+### 统一 10 病例 STL 对比集
+
+## DPSR 表面改进实验（2026-07-29）
+
+M0-M3 的实验定义保持不变。以下实验是共用的隐式表面训练和 STL 导出消融，
+不能重命名为新的 M0、M1、M2 或 M3。
+
+### E0：iso-level 拓扑安全扫描
+
+不重新训练模型，读取已有 `pred_psr_grid.npy`，在
+`-0.08,-0.06,...,0.08` 上提取候选等值面。选择过程不使用 GT，排序规则为：
+
+1. 优先单连通、watertight、`genus=0`。
+2. 再比较不使用 GT 的平衡分数：
+   `预测点到表面 RMS + 0.25 x margin 到表面 RMS`。
+3. 该权重避免只追求 margin 而把整个牙冠等值面向外过度膨胀。
+4. 条件相同时选择最接近零的 iso-level。
+
+该实验只能减少 DPSR 零水平面选择造成的隧道，不能补回模型未预测出的牙尖和窝沟。
+普通 hole filling 不能修复封闭的隧道型贯穿孔。
+
+```bash
+python scripts/run_dpsr_iso_topology_sweep.py \
+  --source result/20260728/m2_mla_dmc_dpsr128_grid100 \
+  --output result/20260729/e0_m2_iso_topology_sweep
+```
+
+### E1：margin zero-level loss
+
+直接要求 DPSR 隐式场在 margin line 上取零：
+
+```text
+L_margin_zero = mean(abs(phi_pred(margin)))
+```
+
+这与 M2 的点锚定不同。M2 只要求预测点靠近 margin，E1 进一步要求最终 STL
+对应的等值面经过 margin。
+
+### E2：解剖细节监督
+
+用于减少过度平滑，包含：
+
+- `narrow-band loss`：重点监督目标零水平面附近。
+- `multi-scale grid loss`：同时监督整体形态和局部结构。
+- `grid-gradient loss`：保留隐式场的局部变化。
+- `sigma=1.0`：相对于基线 `sigma=2.0` 减少高斯模糊。
+
+只增加输出点数不等价于增加牙尖、窝沟和嵴的监督。
+
+### E3：软拓扑约束
+
+训练时将 PSR grid 下采样到 `32^3`，计算概率体素并匹配 GT 的软 Euler
+characteristic。它是无需额外依赖的可微拓扑代理损失；正式持续同调
+（persistent homology）损失仍作为后续替换方案。
+
+导出时仍必须执行硬性 QC：
+
+```text
+components = 1
+watertight = true
+genus = 0
+```
+
+### E4：组合实验
+
+组合 `margin-zero + narrow-band + multi-scale + grid-gradient + soft-topology`。
+组合权重只能依据训练集和验证集选择，测试集只用于最终报告。
+
+所有实验统一报告：
+
+- point/STL symmetric RMS、HD95、F-score；
+- normal cosine similarity 和 angular error；
+- margin point/STL RMS、HD95；
+- R1 point/STL RMS、HD95、F-score；
+- watertight、Euler characteristic、genus、topology failure rate；
+- 每个 test case 的 GT STL 和预测 STL。
+
+## 统一 10 病例 STL 对比集
+
+从 70 个 test 病例按 M0-M3 平均 STL symmetric RMS 排序，在 10 个等距排名位置选样，避免只展示效果好的病例：
+
+```text
+07266吴嘉雯Z_15
+05797赵娟Z_26
+53237芦重香Z_16
+06045黄凤婷W_36
+30724赵丹丽0_27
+05822马国梁0_27
+50039周艳W_25
+11935王_45
+53351余新爱W_37
+05801赵俊Z_46
+```
+
+每个病例包含：
+
+```text
+<case>__GT.stl
+<case>__M0_pred.stl
+<case>__M1_pred.stl
+<case>__M2_pred.stl
+<case>__M3_pred.stl
+```
+
+服务器目录和压缩包：
+
+```text
+result/20260728/m0_m3_representative10/
+result/20260728/m0_m3_representative10.zip
+```
+
+`selection_manifest.csv` 记录选样排名及四组 STL RMS、genus、`topology_ok`；`metrics_by_sample_and_method.csv` 保存四组逐病例完整指标。
+
+参考实现和论文：
+
+- DMC, From Mesh Completion to AI Designed Crown: <https://arxiv.org/abs/2501.04914>
+- DCrownFormer: <https://papers.miccai.org/miccai-2024/194-Paper0638.html>
+- Shape As Points / DPSR: <https://papers.nips.cc/paper/2021/hash/6cd9313ed34ef58bad3fdd504355e72c-Abstract.html>
+- FoldingNet: <https://arxiv.org/abs/1712.07262>

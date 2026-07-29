@@ -13,6 +13,7 @@ import numpy as np
 import open3d as o3d
 import torch
 from scipy.spatial import cKDTree
+from skimage import measure
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -22,10 +23,15 @@ if str(ROOT) not in sys.path:
 
 from src.crown_m0.dataset import CrownDataset, discover_cases
 from src.crown_m0.io import write_ply, write_xyz
-from src.crown_m0.model import M0CrownNet
+from src.crown_m0.model import (
+    M0CoarseToFineNet,
+    M0CrownNet,
+    M0DMCDPSRNet,
+    M0TangentCoarseToFineNet,
+)
 
 
-OFFICIAL_STL_METHOD = "alpha_clean_taubin"
+DEFAULT_STL_METHOD = "tangent_mls_poisson"
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,9 +51,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment-name", default="m0_baseline")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--sample-points", type=int, default=12000)
+    parser.add_argument(
+        "--stl-method",
+        choices=["alpha_clean_taubin", "tangent_mls_poisson", "dmc_dpsr_marching_cubes"],
+        default=DEFAULT_STL_METHOD,
+    )
     parser.add_argument("--alpha", type=float, default=1.2)
     parser.add_argument("--smooth-iterations", type=int, default=25)
     parser.add_argument("--subdivide-iterations", type=int, default=1)
+    parser.add_argument("--poisson-depth", type=int, default=8)
+    parser.add_argument("--poisson-threads", type=int, default=8)
+    parser.add_argument("--mls-iterations", type=int, default=2)
+    parser.add_argument("--poisson-density-quantile", type=float, default=0.02)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -58,13 +73,14 @@ def main() -> None:
 
     output_dir = args.output_root / args.date / args.experiment_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    write_config(output_dir / "config.json", args)
-
     records = discover_cases(args.data_dir)
     by_case = {str(record.train_dir.parent): record for record in records}
     sample_sets = load_sample_sets(args)
 
     model = load_model(args)
+    if isinstance(model, M0DMCDPSRNet):
+        args.roi_half_extent_mm = model.roi_half_extent_mm
+    write_config(output_dir / "config.json", args)
     all_summary_rows = []
     for sample_set, cases in sample_sets.items():
         selected_records = [by_case[case] for case in cases if case in by_case]
@@ -82,10 +98,42 @@ def main() -> None:
     print(f"wrote {output_dir}", flush=True)
 
 
-def load_model(args: argparse.Namespace) -> M0CrownNet:
+def load_model(args: argparse.Namespace) -> torch.nn.Module:
     checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
     checkpoint_args = checkpoint.get("args", {})
-    model = M0CrownNet(output_points=int(checkpoint_args.get("output_points", 16384))).to(args.device)
+    decoder = str(checkpoint_args.get("decoder", "direct"))
+    if decoder.startswith("dmc_dpsr"):
+        use_margin = decoder != "dmc_dpsr"
+        use_anchor = decoder in {"dmc_dpsr_m2", "dmc_dpsr_m3"}
+        model = M0DMCDPSRNet(
+            model_dim=int(checkpoint_args.get("dmc_model_dim", 256)),
+            context_tokens_per_input=int(checkpoint_args.get("dmc_context_tokens", 256)),
+            num_queries=int(checkpoint_args.get("dmc_queries", 256)),
+            fold_step=int(checkpoint_args.get("dmc_fold_step", 8)),
+            transformer_layers=int(checkpoint_args.get("dmc_transformer_layers", 3)),
+            dpsr_resolution=int(checkpoint_args.get("dpsr_resolution", 128)),
+            dpsr_sigma=float(checkpoint_args.get("dpsr_sigma", 2.0)),
+            roi_half_extent_mm=float(checkpoint_args.get("roi_half_extent_mm", 12.0)),
+            use_margin=use_margin,
+            margin_anchor_queries=(
+                int(checkpoint_args.get("margin_anchor_queries", 64)) if use_anchor else 0
+            ),
+            ring_groups=int(checkpoint_args.get("ring_groups", 6)) if use_anchor else 0,
+        ).to(args.device)
+    elif decoder == "coarse_to_fine_tangent":
+        model = M0TangentCoarseToFineNet(
+            coarse_points=int(checkpoint_args.get("coarse_points", 8192)),
+            first_factor=int(checkpoint_args.get("first_factor", 4)),
+            second_factor=int(checkpoint_args.get("second_factor", 2)),
+        ).to(args.device)
+    elif checkpoint_args.get("decoder") == "coarse_to_fine":
+        model = M0CoarseToFineNet(
+            coarse_points=int(checkpoint_args.get("coarse_points", 8192)),
+            first_factor=int(checkpoint_args.get("first_factor", 4)),
+            second_factor=int(checkpoint_args.get("second_factor", 2)),
+        ).to(args.device)
+    else:
+        model = M0CrownNet(output_points=int(checkpoint_args.get("output_points", 16384))).to(args.device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     return model
@@ -113,16 +161,35 @@ def run_sample_set(
     rows = []
     with torch.no_grad():
         for batch in tqdm(loader, desc=sample_dir.name):
-            pred = model(
+            model_args = (
                 batch["prep"].to(args.device),
                 batch["antagonist"].to(args.device),
                 batch["tooth_index"].to(args.device),
                 batch["prep_arch_index"].to(args.device),
-            ).cpu().numpy()
+            )
+            if isinstance(model, M0DMCDPSRNet):
+                outputs = model(
+                    *model_args,
+                    margin=batch["margin"].to(args.device) if model.use_margin else None,
+                    return_grid=True,
+                )
+                pred = outputs["points"].cpu().numpy()
+                pred_grids = outputs["psr_grid"].cpu().numpy()
+            else:
+                pred = model(*model_args).cpu().numpy()
+                pred_grids = [None] * len(pred)
             crown = batch["crown"].cpu().numpy()
             for i, case in enumerate(batch["case_id"]):
                 case_path = Path(case)
-                row = evaluate_case(case_path, pred[i].astype(np.float32), crown[i].astype(np.float32), sample_dir, args)
+                row = evaluate_case(
+                    case_path,
+                    pred[i].astype(np.float32),
+                    crown[i].astype(np.float32),
+                    sample_dir,
+                    args,
+                    margin_local=batch["margin"][i].cpu().numpy().astype(np.float32),
+                    pred_grid=None if pred_grids[i] is None else pred_grids[i].astype(np.float32),
+                )
                 rows.append(row)
     return rows
 
@@ -133,16 +200,20 @@ def evaluate_case(
     gt_local: np.ndarray,
     sample_dir: Path,
     args: argparse.Namespace,
+    *,
+    margin_local: np.ndarray,
+    pred_grid: np.ndarray | None = None,
 ) -> dict:
     stem = safe_case_name(case_path, args.data_dir)
     case_dir = sample_dir / "cases" / stem
     case_dir.mkdir(parents=True, exist_ok=True)
 
-    row = {"case": str(case_path), "stem": stem, "ok": False, "stl_method": OFFICIAL_STL_METHOD, "error": ""}
+    row = {"case": str(case_path), "stem": stem, "ok": False, "stl_method": args.stl_method, "error": ""}
     pred_npy = case_dir / f"{stem}_pred.npy"
     pred_xyz = case_dir / f"{stem}_pred.xyz"
     pred_ply = case_dir / f"{stem}_pred.ply"
-    pred_stl = case_dir / f"{stem}_pred_{OFFICIAL_STL_METHOD}.stl"
+    pred_grid_npy = case_dir / f"{stem}_pred_psr_grid.npy"
+    pred_stl = case_dir / f"{stem}_pred_{args.stl_method}.stl"
     gt_stl_copy = case_dir / f"{stem}_GT_technician.stl"
 
     try:
@@ -151,14 +222,52 @@ def evaluate_case(
         write_ply(pred_ply, pred_local)
 
         row.update(prefix_metrics("point", point_metrics(pred_local[:, :3], gt_local[:, :3])))
+        row.update(point_normal_metrics(pred_local, gt_local))
+        row.update(
+            prefix_metrics(
+                "margin_point",
+                margin_distance_metrics(margin_local[:, :3], pred_local[:, :3]),
+            )
+        )
+        row.update(
+            prefix_metrics(
+                "r1_point",
+                regional_surface_metrics(
+                    pred_local[:, :3],
+                    gt_local[:, :3],
+                    margin_local[:, :3],
+                    radius_mm=1.0,
+                ),
+            )
+        )
 
         pred_original = restore_original_coordinates(pred_local, case_path)
-        pred_mesh = reconstruct_alpha_clean(
-            pred_original[:, :3],
-            args.alpha,
-            smooth_iterations=args.smooth_iterations,
-            subdivide_iterations=args.subdivide_iterations,
-        )
+        if args.stl_method == "dmc_dpsr_marching_cubes":
+            if pred_grid is None:
+                raise ValueError("DMC DPSR STL export requires a predicted PSR grid")
+            np.save(pred_grid_npy, pred_grid)
+            pred_mesh = reconstruct_dpsr_grid(
+                pred_grid,
+                case_path,
+                roi_half_extent_mm=float(args.roi_half_extent_mm),
+                smooth_iterations=min(args.smooth_iterations, 5),
+            )
+        elif args.stl_method == "tangent_mls_poisson":
+            pred_mesh = reconstruct_tangent_mls_poisson(
+                pred_original,
+                depth=args.poisson_depth,
+                threads=args.poisson_threads,
+                mls_iterations=args.mls_iterations,
+                density_quantile=args.poisson_density_quantile,
+                smooth_iterations=min(args.smooth_iterations, 10),
+            )
+        else:
+            pred_mesh = reconstruct_alpha_clean(
+                pred_original[:, :3],
+                args.alpha,
+                smooth_iterations=args.smooth_iterations,
+                subdivide_iterations=args.subdivide_iterations,
+            )
         ok = o3d.io.write_triangle_mesh(str(pred_stl), pred_mesh, write_ascii=False)
         if not ok:
             raise RuntimeError(f"failed to write {pred_stl}")
@@ -168,11 +277,31 @@ def evaluate_case(
             raise FileNotFoundError(f"missing GT STL for {case_path}")
         shutil.copy2(gt_stl, gt_stl_copy)
         gt_mesh = read_mesh(gt_stl)
-        stl_metrics = surface_metrics(
-            sample_mesh_points(pred_mesh, args.sample_points),
-            sample_mesh_points(gt_mesh, args.sample_points),
-        )
+        pred_surface = sample_mesh_points(pred_mesh, args.sample_points)
+        gt_surface = sample_mesh_points(gt_mesh, args.sample_points)
+        stl_metrics = surface_metrics(pred_surface, gt_surface)
         row.update(prefix_metrics("stl", stl_metrics))
+        margin_original = restore_original_coordinates(
+            np.pad(margin_local, ((0, 0), (0, 3))),
+            case_path,
+        )[:, :3]
+        row.update(
+            prefix_metrics(
+                "margin_stl",
+                margin_distance_metrics(margin_original, pred_surface),
+            )
+        )
+        row.update(
+            prefix_metrics(
+                "r1_stl",
+                regional_surface_metrics(
+                    pred_surface,
+                    gt_surface,
+                    margin_original,
+                    radius_mm=1.0,
+                ),
+            )
+        )
         row.update(mesh_stats(pred_mesh))
         row.update(
             {
@@ -180,6 +309,7 @@ def evaluate_case(
                 "pred_npy": str(pred_npy),
                 "pred_xyz": str(pred_xyz),
                 "pred_ply": str(pred_ply),
+                "pred_psr_grid": str(pred_grid_npy) if pred_grid is not None else "",
                 "pred_stl": str(pred_stl),
                 "gt_stl": str(gt_stl_copy),
             }
@@ -187,6 +317,53 @@ def evaluate_case(
     except Exception as exc:
         row["error"] = f"{type(exc).__name__}: {exc}"
     return row
+
+
+def reconstruct_dpsr_grid(
+    grid: np.ndarray,
+    case_path: Path,
+    *,
+    roi_half_extent_mm: float,
+    smooth_iterations: int,
+    level: float = 0.0,
+) -> o3d.geometry.TriangleMesh:
+    """Extract one learned DPSR level set without point-cloud remeshing."""
+    if not (float(grid.min()) <= level <= float(grid.max())):
+        raise ValueError(
+            f"PSR grid has no {level:.6f} crossing: min={float(grid.min()):.6f}, "
+            f"max={float(grid.max()):.6f}"
+        )
+    vertices, faces, _, _ = measure.marching_cubes(grid, level=level)
+    resolution = np.asarray(grid.shape, dtype=np.float64)
+    local_vertices = (
+        vertices.astype(np.float64) / resolution[None, :]
+    ) * (2.0 * roi_half_extent_mm) - roi_half_extent_mm
+    meta = json.loads((case_path / "train" / "metadata.json").read_text(encoding="utf-8"))
+    center = np.asarray(meta["coordinate_processing"]["center_xyz_mm"], dtype=np.float64)
+    vertices_original = local_vertices + center[None, :]
+
+    mesh = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(vertices_original),
+        o3d.utility.Vector3iVector(faces.astype(np.int32)),
+    )
+    mesh = keep_largest_mesh_component(mesh)
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_duplicated_vertices()
+    mesh.remove_non_manifold_edges()
+    mesh.remove_unreferenced_vertices()
+    mesh = keep_largest_mesh_component(mesh)
+    if smooth_iterations > 0:
+        mesh = mesh.filter_smooth_taubin(
+            number_of_iterations=smooth_iterations,
+            lambda_filter=0.5,
+            mu=-0.53,
+        )
+    mesh.compute_vertex_normals()
+    mesh.compute_triangle_normals()
+    if len(mesh.triangles) == 0:
+        raise ValueError("empty DPSR marching-cubes mesh")
+    return mesh
 
 
 def reconstruct_alpha_clean(
@@ -237,6 +414,123 @@ def reconstruct_alpha_clean(
     return mesh
 
 
+def project_points_mls(
+    xyz: np.ndarray,
+    reference_normals: np.ndarray,
+    *,
+    iterations: int,
+    neighbors: int = 24,
+    strength: float = 0.75,
+) -> tuple[np.ndarray, np.ndarray]:
+    projected = np.asarray(xyz, dtype=np.float64).copy()
+    reference = np.asarray(reference_normals, dtype=np.float64).copy()
+    reference /= np.maximum(np.linalg.norm(reference, axis=1, keepdims=True), 1e-8)
+    for _ in range(max(iterations, 0)):
+        tree = cKDTree(projected)
+        _, indices = tree.query(projected, k=min(neighbors, len(projected)))
+        neighborhoods = projected[indices]
+        centroids = neighborhoods.mean(axis=1)
+        normals = reference[indices].mean(axis=1)
+        normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-8)
+        flip = np.sum(normals * reference, axis=1) < 0
+        normals[flip] *= -1.0
+        signed = np.sum((centroids - projected) * normals, axis=1)
+        signed = np.clip(signed, -0.08, 0.08)
+        projected += strength * signed[:, None] * normals
+        reference = normals
+    return projected, reference
+
+
+def keep_largest_mesh_component(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
+    if len(mesh.triangles) == 0:
+        return mesh
+    labels, counts, _ = mesh.cluster_connected_triangles()
+    counts_np = np.asarray(counts)
+    if counts_np.size > 1:
+        labels_np = np.asarray(labels)
+        mesh.remove_triangles_by_mask(labels_np != int(np.argmax(counts_np)))
+        mesh.remove_unreferenced_vertices()
+    return mesh
+
+
+def reconstruct_tangent_mls_poisson(
+    points: np.ndarray,
+    *,
+    depth: int,
+    threads: int,
+    mls_iterations: int,
+    density_quantile: float,
+    smooth_iterations: int,
+) -> o3d.geometry.TriangleMesh:
+    xyz = np.asarray(points[:, :3], dtype=np.float64)
+    normals = np.asarray(points[:, 3:6], dtype=np.float64)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    pcd.normals = o3d.utility.Vector3dVector(normals)
+    clean, indices = pcd.remove_statistical_outlier(nb_neighbors=32, std_ratio=1.75)
+    if len(clean.points) >= 1000:
+        clean.normals = o3d.utility.Vector3dVector(normals[np.asarray(indices)])
+        pcd = clean
+    pcd = pcd.voxel_down_sample(voxel_size=0.08)
+    pcd.normalize_normals()
+    xyz = np.asarray(pcd.points)
+    normals = np.asarray(pcd.normals)
+
+    xyz, normals = project_points_mls(
+        xyz,
+        normals,
+        iterations=mls_iterations,
+    )
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    pcd.normals = o3d.utility.Vector3dVector(normals)
+    pcd.normalize_normals()
+
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd,
+        depth=depth,
+        scale=1.05,
+        linear_fit=False,
+        n_threads=threads,
+    )
+    densities_np = np.asarray(densities)
+    if densities_np.size:
+        threshold = float(np.quantile(densities_np, density_quantile))
+        mesh.remove_vertices_by_mask(densities_np < threshold)
+
+    xyz_clean = np.asarray(pcd.points)
+    bbox = o3d.geometry.AxisAlignedBoundingBox(
+        xyz_clean.min(axis=0) - 0.20,
+        xyz_clean.max(axis=0) + 0.20,
+    )
+    mesh = mesh.crop(bbox)
+    mesh = keep_largest_mesh_component(mesh)
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_duplicated_vertices()
+    mesh.remove_non_manifold_edges()
+    mesh = keep_largest_mesh_component(mesh)
+    if len(mesh.triangles) > 50000:
+        mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=50000)
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_duplicated_vertices()
+        mesh.remove_non_manifold_edges()
+        mesh.remove_unreferenced_vertices()
+        mesh = keep_largest_mesh_component(mesh)
+    if smooth_iterations > 0:
+        mesh = mesh.filter_smooth_taubin(
+            number_of_iterations=smooth_iterations,
+            lambda_filter=0.5,
+            mu=-0.53,
+        )
+    mesh.compute_vertex_normals()
+    mesh.compute_triangle_normals()
+    if len(mesh.triangles) == 0:
+        raise ValueError("empty tangent MLS Poisson mesh")
+    return mesh
+
+
 def restore_original_coordinates(arr: np.ndarray, case_path: Path) -> np.ndarray:
     meta = json.loads((case_path / "train" / "metadata.json").read_text(encoding="utf-8"))
     center = np.asarray(meta["coordinate_processing"]["center_xyz_mm"], dtype=np.float64)
@@ -271,6 +565,13 @@ def surface_metrics(pred_xyz: np.ndarray, gt_xyz: np.ndarray) -> dict[str, float
     pred_to_gt, _ = cKDTree(gt_xyz).query(pred_xyz, k=1)
     gt_to_pred, _ = cKDTree(pred_xyz).query(gt_xyz, k=1)
     both = np.concatenate([pred_to_gt, gt_to_pred])
+    precision_0p3 = float(np.mean(pred_to_gt <= 0.3))
+    recall_0p3 = float(np.mean(gt_to_pred <= 0.3))
+    fscore_0p3 = (
+        2.0 * precision_0p3 * recall_0p3 / (precision_0p3 + recall_0p3)
+        if precision_0p3 + recall_0p3 > 0
+        else 0.0
+    )
     return {
         "pred_to_gt_mean": mean(pred_to_gt),
         "pred_to_gt_rms": rms(pred_to_gt),
@@ -280,12 +581,89 @@ def surface_metrics(pred_xyz: np.ndarray, gt_xyz: np.ndarray) -> dict[str, float
         "gt_to_pred_hd95": percentile(gt_to_pred, 95),
         "symmetric_mean": mean(both),
         "symmetric_rms": rms(both),
+        "precision_0p3": precision_0p3,
+        "recall_0p3": recall_0p3,
+        "fscore_0p3": fscore_0p3,
     }
+
+
+def point_normal_metrics(
+    pred: np.ndarray,
+    gt: np.ndarray,
+) -> dict[str, float]:
+    if pred.shape[1] < 6 or gt.shape[1] < 6:
+        return {
+            "point_normal_cosine_similarity": float("nan"),
+            "point_normal_angular_error_deg": float("nan"),
+        }
+    _, nearest = cKDTree(gt[:, :3]).query(pred[:, :3], k=1)
+    pred_normals = pred[:, 3:6].astype(np.float64)
+    gt_normals = gt[nearest, 3:6].astype(np.float64)
+    pred_normals /= np.maximum(np.linalg.norm(pred_normals, axis=1, keepdims=True), 1e-8)
+    gt_normals /= np.maximum(np.linalg.norm(gt_normals, axis=1, keepdims=True), 1e-8)
+    cosine = np.clip(np.sum(pred_normals * gt_normals, axis=1), -1.0, 1.0)
+    return {
+        "point_normal_cosine_similarity": float(np.mean(cosine)),
+        "point_normal_angular_error_deg": float(np.degrees(np.arccos(cosine)).mean()),
+    }
+
+
+def margin_distance_metrics(
+    margin_xyz: np.ndarray,
+    surface_xyz: np.ndarray,
+) -> dict[str, float]:
+    distances, _ = cKDTree(surface_xyz).query(margin_xyz, k=1)
+    return {
+        "mean": mean(distances),
+        "rms": rms(distances),
+        "hd95": percentile(distances, 95),
+    }
+
+
+def regional_surface_metrics(
+    pred_xyz: np.ndarray,
+    gt_xyz: np.ndarray,
+    margin_xyz: np.ndarray,
+    *,
+    radius_mm: float,
+) -> dict[str, float]:
+    pred_distance, _ = cKDTree(margin_xyz).query(pred_xyz, k=1)
+    gt_distance, _ = cKDTree(margin_xyz).query(gt_xyz, k=1)
+    pred_region = pred_xyz[pred_distance <= radius_mm]
+    gt_region = gt_xyz[gt_distance <= radius_mm]
+    if len(pred_region) < 10 or len(gt_region) < 10:
+        return {
+            "pred_to_gt_mean": float("nan"),
+            "pred_to_gt_rms": float("nan"),
+            "pred_to_gt_hd95": float("nan"),
+            "gt_to_pred_mean": float("nan"),
+            "gt_to_pred_rms": float("nan"),
+            "gt_to_pred_hd95": float("nan"),
+            "symmetric_mean": float("nan"),
+            "symmetric_rms": float("nan"),
+        }
+    return surface_metrics(pred_region, gt_region)
 
 
 def mesh_stats(mesh: o3d.geometry.TriangleMesh) -> dict:
     labels, counts, _ = mesh.cluster_connected_triangles()
     counts_np = np.asarray(counts)
+    triangles = np.asarray(mesh.triangles)
+    edges = np.sort(
+        np.concatenate(
+            [
+                triangles[:, [0, 1]],
+                triangles[:, [1, 2]],
+                triangles[:, [2, 0]],
+            ],
+            axis=0,
+        ),
+        axis=1,
+    )
+    unique_edges, edge_counts = np.unique(edges, axis=0, return_counts=True)
+    euler_characteristic = int(len(mesh.vertices) - len(unique_edges) + len(triangles))
+    watertight = bool(np.all(edge_counts == 2))
+    genus = float((2 - euler_characteristic) / 2) if watertight else float("nan")
     return {
         "vertices": int(len(mesh.vertices)),
         "triangles": int(len(mesh.triangles)),
@@ -294,6 +672,10 @@ def mesh_stats(mesh: o3d.geometry.TriangleMesh) -> dict:
         "surface_area": float(mesh.get_surface_area()),
         "edge_manifold": bool(mesh.is_edge_manifold()),
         "vertex_manifold": bool(mesh.is_vertex_manifold()),
+        "watertight": watertight,
+        "euler_characteristic": euler_characteristic,
+        "genus": genus,
+        "topology_ok": bool(watertight and abs(genus) < 0.5),
     }
 
 
@@ -318,18 +700,46 @@ def summarize_rows(rows: list[dict]) -> dict[str, dict]:
         "point_symmetric_rms",
         "point_pred_to_gt_hd95",
         "point_gt_to_pred_hd95",
+        "point_fscore_0p3",
+        "point_precision_0p3",
+        "point_recall_0p3",
+        "point_normal_cosine_similarity",
+        "point_normal_angular_error_deg",
         "stl_pred_to_gt_rms",
         "stl_gt_to_pred_rms",
         "stl_symmetric_rms",
         "stl_pred_to_gt_hd95",
         "stl_gt_to_pred_hd95",
+        "stl_fscore_0p3",
+        "stl_precision_0p3",
+        "stl_recall_0p3",
+        "margin_point_mean",
+        "margin_point_rms",
+        "margin_point_hd95",
+        "r1_point_symmetric_rms",
+        "r1_point_pred_to_gt_hd95",
+        "r1_point_gt_to_pred_hd95",
+        "r1_point_fscore_0p3",
+        "margin_stl_mean",
+        "margin_stl_rms",
+        "margin_stl_hd95",
+        "r1_stl_symmetric_rms",
+        "r1_stl_pred_to_gt_hd95",
+        "r1_stl_gt_to_pred_hd95",
+        "r1_stl_fscore_0p3",
         "triangles",
         "surface_area",
+        "watertight",
+        "genus",
+        "topology_ok",
     ]
-    summary = {OFFICIAL_STL_METHOD: {"method": OFFICIAL_STL_METHOD, "n": len(ok_rows)}}
-    item = summary[OFFICIAL_STL_METHOD]
+    source_rows = ok_rows or rows
+    method = str(source_rows[0].get("stl_method", DEFAULT_STL_METHOD)) if source_rows else DEFAULT_STL_METHOD
+    summary = {method: {"method": method, "n": len(ok_rows)}}
+    item = summary[method]
     for key in metric_keys:
         values = np.asarray([float(row[key]) for row in ok_rows if row.get(key) not in ("", None)], dtype=float)
+        values = values[np.isfinite(values)]
         if values.size:
             item[f"{key}_mean"] = float(np.mean(values))
             item[f"{key}_median"] = float(np.median(values))
@@ -342,7 +752,7 @@ def write_config(path: Path, args: argparse.Namespace) -> None:
     for key, value in payload.items():
         if isinstance(value, Path):
             payload[key] = str(value)
-    payload["official_stl_method"] = OFFICIAL_STL_METHOD
+    payload["official_stl_method"] = args.stl_method
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 

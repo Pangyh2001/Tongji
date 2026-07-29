@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from .dpsr import sample_grid
+
 
 def sample_points(points: torch.Tensor, count: int) -> torch.Tensor:
     if points.shape[1] <= count:
@@ -52,6 +54,444 @@ def m0_loss(
         )
         loss = loss + normal_weight * normal_loss
     return loss, {"loss": float(loss.detach().cpu()), "chamfer": float(cd.detach().cpu()), "normal": float(normal_loss.detach().cpu())}
+
+
+def dmc_dpsr_loss(
+    pred_points: torch.Tensor,
+    pred_grid: torch.Tensor,
+    target_points: torch.Tensor,
+    target_grid: torch.Tensor,
+    *,
+    chamfer_points: int = 4096,
+    normal_weight: float = 0.05,
+    grid_weight: float = 1.0,
+    margin: torch.Tensor | None = None,
+    margin_anchor_weight: float = 0.0,
+    margin_risk_weight: float = 0.0,
+    margin_risk_alpha: float = 3.0,
+    margin_risk_sigma_mm: float = 1.0,
+    roi_half_extent_mm: float = 12.0,
+    margin_zero_weight: float = 0.0,
+    narrow_band_weight: float = 0.0,
+    narrow_band_width: float = 0.08,
+    multiscale_grid_weight: float = 0.0,
+    grid_gradient_weight: float = 0.0,
+    topology_weight: float = 0.0,
+    topology_resolution: int = 32,
+    topology_temperature: float = 0.05,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Jointly supervise DMC points and the reconstructed Poisson indicator."""
+    point_loss, point_metrics = m0_loss(
+        pred_points,
+        target_points,
+        chamfer_points=chamfer_points,
+        normal_weight=normal_weight,
+    )
+    pred_indicator = torch.tanh(pred_grid)
+    target_indicator = torch.tanh(target_grid)
+    grid_mse = F.mse_loss(pred_indicator, target_indicator)
+    grid_l1 = F.l1_loss(pred_indicator, target_indicator)
+    narrow_band = pred_points.new_tensor(0.0)
+    if narrow_band_weight > 0:
+        band = torch.exp(-target_indicator.abs() / max(narrow_band_width, 1e-6))
+        narrow_band = (
+            band * (pred_indicator - target_indicator).square()
+        ).sum() / band.sum().clamp_min(1.0)
+    multiscale_grid = pred_points.new_tensor(0.0)
+    if multiscale_grid_weight > 0:
+        for factor in (2, 4):
+            pred_coarse = F.avg_pool3d(
+                pred_indicator.unsqueeze(1), kernel_size=factor, stride=factor
+            )
+            target_coarse = F.avg_pool3d(
+                target_indicator.unsqueeze(1), kernel_size=factor, stride=factor
+            )
+            multiscale_grid = multiscale_grid + F.mse_loss(pred_coarse, target_coarse)
+    grid_gradient = pred_points.new_tensor(0.0)
+    if grid_gradient_weight > 0:
+        for dim in (1, 2, 3):
+            pred_diff = torch.diff(pred_indicator, dim=dim)
+            target_diff = torch.diff(target_indicator, dim=dim)
+            grid_gradient = grid_gradient + F.l1_loss(pred_diff, target_diff)
+    topology = pred_points.new_tensor(0.0)
+    if topology_weight > 0:
+        topology = soft_euler_topology_loss(
+            pred_grid,
+            target_grid,
+            resolution=topology_resolution,
+            temperature=topology_temperature,
+        )
+    margin_anchor = pred_points.new_tensor(0.0)
+    margin_risk = pred_points.new_tensor(0.0)
+    margin_zero = pred_points.new_tensor(0.0)
+    if margin is not None and (
+        margin_anchor_weight > 0
+        or margin_risk_weight > 0
+        or margin_zero_weight > 0
+    ):
+        margin_sample = sample_points(margin, 512)
+        pred_sample = sample_points(pred_points, chamfer_points)
+        target_sample = sample_points(target_points, chamfer_points)
+        if margin_anchor_weight > 0:
+            margin_to_pred = torch.cdist(
+                margin_sample[..., :3],
+                pred_sample[..., :3],
+            ).min(dim=2).values
+            margin_anchor = margin_to_pred.mean()
+        if margin_risk_weight > 0:
+            pairwise = torch.cdist(
+                pred_sample[..., :3],
+                target_sample[..., :3],
+            )
+            pred_min = pairwise.min(dim=2).values
+            target_min = pairwise.min(dim=1).values
+            pred_margin_distance = torch.cdist(
+                pred_sample[..., :3],
+                margin_sample[..., :3],
+            ).min(dim=2).values
+            target_margin_distance = torch.cdist(
+                target_sample[..., :3],
+                margin_sample[..., :3],
+            ).min(dim=2).values
+            pred_weights = 1.0 + margin_risk_alpha * torch.exp(
+                -pred_margin_distance.square() / (2.0 * margin_risk_sigma_mm**2)
+            )
+            target_weights = 1.0 + margin_risk_alpha * torch.exp(
+                -target_margin_distance.square() / (2.0 * margin_risk_sigma_mm**2)
+            )
+            margin_risk = (
+                (pred_min * pred_weights).sum(dim=1) / pred_weights.sum(dim=1)
+                + (target_min * target_weights).sum(dim=1) / target_weights.sum(dim=1)
+            ).mean()
+        if margin_zero_weight > 0:
+            normalized_margin = (
+                margin_sample[..., :3] + roi_half_extent_mm
+            ) / (2.0 * roi_half_extent_mm)
+            margin_zero = sample_grid(
+                pred_grid,
+                normalized_margin.clamp(0.0, 1.0),
+            ).abs().mean()
+    loss = (
+        point_loss
+        + grid_weight * grid_mse
+        + margin_anchor_weight * margin_anchor
+        + margin_risk_weight * margin_risk
+        + margin_zero_weight * margin_zero
+        + narrow_band_weight * narrow_band
+        + multiscale_grid_weight * multiscale_grid
+        + grid_gradient_weight * grid_gradient
+        + topology_weight * topology
+    )
+    return loss, {
+        "loss": float(loss.detach().cpu()),
+        "chamfer": point_metrics["chamfer"],
+        "normal": point_metrics["normal"],
+        "grid_mse": float(grid_mse.detach().cpu()),
+        "grid_l1": float(grid_l1.detach().cpu()),
+        "margin_anchor": float(margin_anchor.detach().cpu()),
+        "margin_risk": float(margin_risk.detach().cpu()),
+        "margin_zero": float(margin_zero.detach().cpu()),
+        "narrow_band": float(narrow_band.detach().cpu()),
+        "multiscale_grid": float(multiscale_grid.detach().cpu()),
+        "grid_gradient": float(grid_gradient.detach().cpu()),
+        "topology": float(topology.detach().cpu()),
+    }
+
+
+def _soft_or(cells: list[torch.Tensor]) -> torch.Tensor:
+    complement = torch.ones_like(cells[0])
+    for cell in cells:
+        complement = complement * (1.0 - cell)
+    return 1.0 - complement
+
+
+def _pad_shift(
+    values: torch.Tensor,
+    *,
+    depth: int = 0,
+    height: int = 0,
+    width: int = 0,
+) -> torch.Tensor:
+    return F.pad(
+        values,
+        (
+            width,
+            1 - width,
+            height,
+            1 - height,
+            depth,
+            1 - depth,
+        ),
+    )
+
+
+def soft_euler_characteristic(occupancy: torch.Tensor) -> torch.Tensor:
+    """Differentiable Euler characteristic of a probabilistic voxel union."""
+    vertices = _soft_or(
+        [
+            _pad_shift(occupancy, depth=d, height=h, width=w)
+            for d in (0, 1)
+            for h in (0, 1)
+            for w in (0, 1)
+        ]
+    ).sum(dim=(1, 2, 3))
+
+    edges_d = _soft_or(
+        [
+            F.pad(occupancy, (w, 1 - w, h, 1 - h, 0, 0))
+            for h in (0, 1)
+            for w in (0, 1)
+        ]
+    ).sum(dim=(1, 2, 3))
+    edges_h = _soft_or(
+        [
+            F.pad(occupancy, (w, 1 - w, 0, 0, d, 1 - d))
+            for d in (0, 1)
+            for w in (0, 1)
+        ]
+    ).sum(dim=(1, 2, 3))
+    edges_w = _soft_or(
+        [
+            F.pad(occupancy, (0, 0, h, 1 - h, d, 1 - d))
+            for d in (0, 1)
+            for h in (0, 1)
+        ]
+    ).sum(dim=(1, 2, 3))
+
+    faces_d = _soft_or(
+        [F.pad(occupancy, (0, 0, 0, 0, d, 1 - d)) for d in (0, 1)]
+    ).sum(dim=(1, 2, 3))
+    faces_h = _soft_or(
+        [F.pad(occupancy, (0, 0, h, 1 - h, 0, 0)) for h in (0, 1)]
+    ).sum(dim=(1, 2, 3))
+    faces_w = _soft_or(
+        [F.pad(occupancy, (w, 1 - w, 0, 0, 0, 0)) for w in (0, 1)]
+    ).sum(dim=(1, 2, 3))
+
+    cubes = occupancy.sum(dim=(1, 2, 3))
+    return vertices - edges_d - edges_h - edges_w + faces_d + faces_h + faces_w - cubes
+
+
+def soft_euler_topology_loss(
+    pred_grid: torch.Tensor,
+    target_grid: torch.Tensor,
+    *,
+    resolution: int = 32,
+    temperature: float = 0.05,
+) -> torch.Tensor:
+    """Match target solid topology on a low-resolution differentiable grid."""
+    size = (resolution, resolution, resolution)
+    pred_small = F.interpolate(
+        pred_grid.unsqueeze(1), size=size, mode="trilinear", align_corners=True
+    )[:, 0]
+    target_small = F.interpolate(
+        target_grid.unsqueeze(1), size=size, mode="trilinear", align_corners=True
+    )[:, 0]
+    pred_occupancy = torch.sigmoid(pred_small / max(temperature, 1e-6))
+    target_occupancy = torch.sigmoid(target_small / max(temperature, 1e-6))
+    pred_euler = soft_euler_characteristic(pred_occupancy)
+    with torch.no_grad():
+        target_euler = soft_euler_characteristic(target_occupancy)
+    return (pred_euler - target_euler).square().mean()
+
+
+def sibling_repulsion_loss(offsets: torch.Tensor, min_distance: float) -> torch.Tensor:
+    """Keep children generated from one parent from collapsing together."""
+    factor = offsets.shape[2]
+    if factor < 2:
+        return offsets.new_tensor(0.0)
+    distances = torch.cdist(offsets, offsets)
+    eye = torch.eye(factor, device=offsets.device, dtype=torch.bool)
+    distances = distances.masked_fill(eye[None, None, :, :], float("inf"))
+    nearest = distances.min(dim=-1).values
+    return torch.relu(min_distance - nearest).square().mean()
+
+
+def point_uniformity_loss(points: torch.Tensor, count: int = 1024, neighbors: int = 4) -> torch.Tensor:
+    """Penalize large variation in local nearest-neighbor spacing."""
+    xyz = sample_points(points, count)[..., :3]
+    distances = torch.cdist(xyz, xyz)
+    eye = torch.eye(xyz.shape[1], device=xyz.device, dtype=torch.bool)
+    distances = distances.masked_fill(eye[None, :, :], float("inf"))
+    local_spacing = distances.topk(k=min(neighbors, xyz.shape[1] - 1), largest=False).values.mean(dim=-1)
+    mean = local_spacing.mean(dim=1, keepdim=True).clamp_min(1e-6)
+    return ((local_spacing - mean) / mean).square().mean()
+
+
+def coarse_to_fine_loss(
+    stages: list[torch.Tensor],
+    offsets: list[torch.Tensor],
+    target: torch.Tensor,
+    *,
+    chamfer_points: int = 2048,
+    normal_weight: float = 0.05,
+    stage_weights: tuple[float, float, float] = (0.2, 0.3, 0.5),
+    repulsion_weight: float = 0.10,
+    uniformity_weight: float = 0.01,
+    offset_weight: float = 0.001,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if len(stages) != 3 or len(offsets) != 2:
+        raise ValueError("coarse-to-fine loss expects three stages and two offset tensors")
+
+    total = target.new_tensor(0.0)
+    stage_metrics = []
+    for stage, weight in zip(stages, stage_weights):
+        stage_loss, metrics = m0_loss(
+            stage,
+            target,
+            chamfer_points=chamfer_points,
+            normal_weight=normal_weight,
+        )
+        total = total + weight * stage_loss
+        stage_metrics.append(metrics)
+
+    repulsion_32k = sibling_repulsion_loss(offsets[0], min_distance=0.08)
+    repulsion_64k = sibling_repulsion_loss(offsets[1], min_distance=0.04)
+    repulsion = repulsion_32k + repulsion_64k
+    uniformity = point_uniformity_loss(stages[-1])
+    offset_regularization = sum(item.square().mean() for item in offsets)
+    total = (
+        total
+        + repulsion_weight * repulsion
+        + uniformity_weight * uniformity
+        + offset_weight * offset_regularization
+    )
+    return total, {
+        "loss": float(total.detach().cpu()),
+        "coarse_chamfer": stage_metrics[0]["chamfer"],
+        "middle_chamfer": stage_metrics[1]["chamfer"],
+        "fine_chamfer": stage_metrics[2]["chamfer"],
+        "fine_normal": stage_metrics[2]["normal"],
+        "repulsion": float(repulsion.detach().cpu()),
+        "uniformity": float(uniformity.detach().cpu()),
+        "offset": float(offset_regularization.detach().cpu()),
+    }
+
+
+def tangent_sibling_repulsion_loss(
+    offsets: torch.Tensor,
+    parent_normals: torch.Tensor,
+    min_distance: float,
+) -> torch.Tensor:
+    factor = offsets.shape[2]
+    if factor < 2:
+        return offsets.new_tensor(0.0)
+    normals = F.normalize(parent_normals, dim=-1).unsqueeze(2)
+    tangent_offsets = offsets - (offsets * normals).sum(dim=-1, keepdim=True) * normals
+    distances = torch.cdist(tangent_offsets, tangent_offsets)
+    eye = torch.eye(factor, device=offsets.device, dtype=torch.bool)
+    distances = distances.masked_fill(eye[None, None, :, :], float("inf"))
+    nearest = distances.min(dim=-1).values
+    return torch.relu(min_distance - nearest).square().mean()
+
+
+def local_plane_consistency_loss(points: torch.Tensor, count: int = 1024, neighbors: int = 8) -> torch.Tensor:
+    sampled = sample_points(points, count)
+    xyz = sampled[..., :3]
+    normals = F.normalize(sampled[..., 3:6], dim=-1)
+    distances = torch.cdist(xyz, xyz)
+    eye = torch.eye(xyz.shape[1], device=xyz.device, dtype=torch.bool)
+    distances = distances.masked_fill(eye[None, :, :], float("inf"))
+    neighbor_idx = distances.topk(k=min(neighbors, xyz.shape[1] - 1), largest=False).indices
+    batch_idx = torch.arange(xyz.shape[0], device=xyz.device)[:, None, None]
+    neighbor_xyz = xyz[batch_idx, neighbor_idx]
+    signed_height = ((neighbor_xyz - xyz.unsqueeze(2)) * normals.unsqueeze(2)).sum(dim=-1)
+    return signed_height.abs().mean()
+
+
+def stage_surface_losses(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    count: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    pred_sample = sample_points(pred, count)
+    target_sample = sample_points(target, count)
+    pred_xyz = pred_sample[..., :3]
+    target_xyz = target_sample[..., :3]
+    distances = torch.cdist(pred_xyz, target_xyz)
+    pred_min, pred_to_target = distances.min(dim=2)
+    target_min = distances.min(dim=1).values
+    chamfer = pred_min.mean() + target_min.mean()
+
+    pred_normals = F.normalize(pred_sample[..., 3:6], dim=-1)
+    target_normals = F.normalize(target_sample[..., 3:6], dim=-1)
+    gathered_target_xyz = torch.gather(
+        target_xyz,
+        1,
+        pred_to_target.unsqueeze(-1).expand(-1, -1, 3),
+    )
+    gathered_target_normals = torch.gather(
+        target_normals,
+        1,
+        pred_to_target.unsqueeze(-1).expand(-1, -1, 3),
+    )
+    normal = (1.0 - (pred_normals * gathered_target_normals).sum(dim=-1)).mean()
+    point_to_plane = (
+        (pred_xyz - gathered_target_xyz) * gathered_target_normals
+    ).sum(dim=-1).abs().mean()
+    return chamfer, normal, point_to_plane
+
+
+def tangent_coarse_to_fine_loss(
+    stages: list[torch.Tensor],
+    offsets: list[torch.Tensor],
+    target: torch.Tensor,
+    *,
+    chamfer_points: int = 8192,
+    normal_weight: float = 0.20,
+    point_to_plane_weight: float = 0.50,
+    local_plane_weight: float = 0.20,
+    repulsion_weight: float = 0.10,
+    uniformity_weight: float = 0.01,
+    normal_drift_weight: float = 0.50,
+    stage_weights: tuple[float, float, float] = (0.2, 0.3, 0.5),
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if len(stages) != 3 or len(offsets) != 2:
+        raise ValueError("tangent coarse-to-fine loss expects three stages and two offset tensors")
+
+    total = target.new_tensor(0.0)
+    stage_values = []
+    for stage, weight in zip(stages, stage_weights):
+        chamfer, normal, point_to_plane = stage_surface_losses(stage, target, count=chamfer_points)
+        stage_loss = chamfer + normal_weight * normal + point_to_plane_weight * point_to_plane
+        total = total + weight * stage_loss
+        stage_values.append((chamfer, normal, point_to_plane))
+
+    repulsion = tangent_sibling_repulsion_loss(
+        offsets[0],
+        stages[0][..., 3:6],
+        min_distance=0.05,
+    ) + tangent_sibling_repulsion_loss(
+        offsets[1],
+        stages[1][..., 3:6],
+        min_distance=0.025,
+    )
+    uniformity = point_uniformity_loss(stages[-1])
+    local_plane = local_plane_consistency_loss(stages[-1])
+    normal_drift = sum(
+        ((item * F.normalize(parent[..., 3:6], dim=-1).unsqueeze(2)).sum(dim=-1)).abs().mean()
+        for item, parent in zip(offsets, stages[:-1])
+    )
+    total = (
+        total
+        + repulsion_weight * repulsion
+        + uniformity_weight * uniformity
+        + local_plane_weight * local_plane
+        + normal_drift_weight * normal_drift
+    )
+    return total, {
+        "loss": float(total.detach().cpu()),
+        "coarse_chamfer": float(stage_values[0][0].detach().cpu()),
+        "middle_chamfer": float(stage_values[1][0].detach().cpu()),
+        "fine_chamfer": float(stage_values[2][0].detach().cpu()),
+        "fine_normal": float(stage_values[2][1].detach().cpu()),
+        "fine_point_to_plane": float(stage_values[2][2].detach().cpu()),
+        "repulsion": float(repulsion.detach().cpu()),
+        "uniformity": float(uniformity.detach().cpu()),
+        "local_plane": float(local_plane.detach().cpu()),
+        "normal_drift": float(normal_drift.detach().cpu()),
+    }
 
 
 def edge_length_loss(vertices: torch.Tensor, template_vertices: torch.Tensor, edges: torch.Tensor) -> torch.Tensor:
