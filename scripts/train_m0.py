@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("runs/m0"))
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -235,7 +236,11 @@ def run_epoch(
         sums = {"loss": 0.0, "chamfer": 0.0, "normal": 0.0}
     count = 0
 
-    for batch in tqdm(loader, desc="train" if training else "val", leave=False):
+    if training:
+        optimizer.zero_grad(set_to_none=True)
+    for batch_index, batch in enumerate(
+        tqdm(loader, desc="train" if training else "val", leave=False), start=1
+    ):
         prep = batch["prep"].to(args.device, non_blocking=True)
         antagonist = batch["antagonist"].to(args.device, non_blocking=True)
         crown = batch["crown"].to(args.device, non_blocking=True)
@@ -331,10 +336,15 @@ def run_epoch(
                     normal_weight=args.normal_weight,
                 )
             if training:
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                (loss / args.gradient_accumulation_steps).backward()
+                should_step = (
+                    batch_index % args.gradient_accumulation_steps == 0
+                    or batch_index == len(loader)
+                )
+                if should_step:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
 
         bs = prep.shape[0]
         count += bs
