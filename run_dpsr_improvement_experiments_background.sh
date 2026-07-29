@@ -8,6 +8,8 @@ DATE="${DATE:-20260729}"
 EPOCHS="${EPOCHS:-60}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 START_STAGE="${START_STAGE:-1}"
+TRAIN_FREE_MB="${TRAIN_FREE_MB:-6000}"
+EVAL_FREE_MB="${EVAL_FREE_MB:-4000}"
 COMMON=(
   --data-dir data
   --split-file splits/m0_patient_split_seed20260706.json
@@ -39,7 +41,7 @@ wait_for_gpu() {
 run_training() {
   name="$1"
   shift
-  wait_for_gpu 14000
+  wait_for_gpu "$TRAIN_FREE_MB"
   mkdir -p "runs/$name"
   echo "[$(date '+%F %T')] starting $name on GPU $GPU"
   CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" -u scripts/train_m0.py \
@@ -50,7 +52,7 @@ run_training() {
 
 run_evaluation() {
   name="$1"
-  wait_for_gpu 4000
+  wait_for_gpu "$EVAL_FREE_MB"
   CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" -u scripts/run_m0_official_experiment.py \
     --checkpoint "runs/$name/best.pt" \
     --data-dir data \
