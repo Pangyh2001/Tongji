@@ -13,6 +13,8 @@ COMMON=(
   --epochs "$EPOCHS"
   --batch-size "$BATCH_SIZE"
   --gradient-accumulation-steps 16
+  --init-checkpoint runs/m2_mla_dmc_dpsr128_grid100/best.pt
+  --freeze-batch-norm
   --num-workers 2
   --chamfer-points 4096
   --decoder dmc_dpsr_m2

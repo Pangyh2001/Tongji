@@ -32,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train M0 crown generation baseline.")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--output-dir", type=Path, default=Path("runs/m0"))
+    parser.add_argument("--init-checkpoint", type=Path, default=None)
+    parser.add_argument("--freeze-batch-norm", action="store_true")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
@@ -131,6 +133,20 @@ def main() -> None:
     )
 
     model = build_model(args).to(args.device)
+    if args.init_checkpoint:
+        checkpoint = torch.load(args.init_checkpoint, map_location=args.device, weights_only=False)
+        initial_state = {
+            key: value
+            for key, value in checkpoint["model_state"].items()
+            if not key.endswith("dpsr.omega") and not key.endswith("dpsr.gaussian")
+        }
+        missing, unexpected = model.load_state_dict(initial_state, strict=False)
+        allowed_missing = {"dpsr.omega", "dpsr.gaussian"}
+        if set(missing) - allowed_missing or unexpected:
+            raise RuntimeError(
+                f"checkpoint mismatch: missing={missing}, unexpected={unexpected}"
+            )
+        print(f"initialized model from {args.init_checkpoint}", flush=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     best_val = float("inf")
 
@@ -193,6 +209,10 @@ def run_epoch(
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
+    if training and args.freeze_batch_norm:
+        for module in model.modules():
+            if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                module.eval()
     if args.decoder.startswith("dmc_dpsr"):
         sums = {
             "loss": 0.0,

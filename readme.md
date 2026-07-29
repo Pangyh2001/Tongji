@@ -1009,6 +1009,10 @@ L_margin_zero = mean(abs(phi_pred(margin)))
 这与 M2 的点锚定不同。M2 只要求预测点靠近 margin，E1 进一步要求最终 STL
 对应的等值面经过 margin。
 
+受共享服务器显存限制，E1-E4 使用物理 batch 1、梯度累积 16，并从原 M2
+最优 checkpoint 微调。Folding decoder 含有 BatchNorm，因此微调时冻结其
+running statistics；否则物理 batch 1 与基线 batch 16 不可直接比较。
+
 ### E2：解剖细节监督
 
 用于减少过度平滑，包含：
