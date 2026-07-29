@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smooth-iterations", type=int, default=5)
     parser.add_argument("--sample-points", type=int, default=12000)
     parser.add_argument("--max-cases", type=int, default=0)
+    parser.add_argument("--margin-score-weight", type=float, default=0.25)
     return parser.parse_args()
 
 
@@ -61,6 +62,7 @@ def candidate_score(
     pred_xyz: np.ndarray,
     margin_xyz: np.ndarray,
     level: float,
+    margin_score_weight: float,
 ) -> tuple:
     stats = mesh_stats(mesh)
     vertices = np.asarray(mesh.vertices)
@@ -70,11 +72,14 @@ def candidate_score(
     genus = float(stats["genus"])
     topology_rank = 0 if stats["topology_ok"] else (1 if stats["watertight"] else 2)
     genus_rank = abs(genus) if math.isfinite(genus) else 999.0
+    point_rms = float(np.sqrt(np.mean(pred_dist**2)))
+    margin_rms = float(np.sqrt(np.mean(margin_dist**2)))
     return (
         topology_rank,
         genus_rank,
-        float(np.sqrt(np.mean(margin_dist**2))),
-        float(np.sqrt(np.mean(pred_dist**2))),
+        point_rms + margin_score_weight * margin_rms,
+        point_rms,
+        margin_rms,
         abs(level),
     )
 
@@ -115,7 +120,13 @@ def main() -> None:
                     smooth_iterations=args.smooth_iterations,
                     level=level,
                 )
-                score = candidate_score(mesh, pred_original, margin_original, level)
+                score = candidate_score(
+                    mesh,
+                    pred_original,
+                    margin_original,
+                    level,
+                    args.margin_score_weight,
+                )
                 stats = mesh_stats(mesh)
                 candidates.append((score, level, mesh, stats))
                 level_rows.append(
