@@ -325,14 +325,15 @@ def reconstruct_dpsr_grid(
     *,
     roi_half_extent_mm: float,
     smooth_iterations: int,
+    level: float = 0.0,
 ) -> o3d.geometry.TriangleMesh:
-    """Extract the model's learned zero level set without point-cloud remeshing."""
-    if not (float(grid.min()) <= 0.0 <= float(grid.max())):
+    """Extract one learned DPSR level set without point-cloud remeshing."""
+    if not (float(grid.min()) <= level <= float(grid.max())):
         raise ValueError(
-            f"PSR grid has no zero crossing: min={float(grid.min()):.6f}, "
+            f"PSR grid has no {level:.6f} crossing: min={float(grid.min()):.6f}, "
             f"max={float(grid.max()):.6f}"
         )
-    vertices, faces, _, _ = measure.marching_cubes(grid, level=0.0)
+    vertices, faces, _, _ = measure.marching_cubes(grid, level=level)
     resolution = np.asarray(grid.shape, dtype=np.float64)
     local_vertices = (
         vertices.astype(np.float64) / resolution[None, :]

@@ -973,6 +973,82 @@ result/20260728/m0_m3_stl_comparison.png
 
 ### 统一 10 病例 STL 对比集
 
+## DPSR 表面改进实验（2026-07-29）
+
+M0-M3 的实验定义保持不变。以下实验是共用的隐式表面训练和 STL 导出消融，
+不能重命名为新的 M0、M1、M2 或 M3。
+
+### E0：iso-level 拓扑安全扫描
+
+不重新训练模型，读取已有 `pred_psr_grid.npy`，在
+`-0.08,-0.06,...,0.08` 上提取候选等值面。选择过程不使用 GT，排序规则为：
+
+1. 优先单连通、watertight、`genus=0`。
+2. 再比较 margin 到候选表面的 RMS。
+3. 再比较预测点到候选表面的 RMS。
+4. 条件相同时选择最接近零的 iso-level。
+
+该实验只能减少 DPSR 零水平面选择造成的隧道，不能补回模型未预测出的牙尖和窝沟。
+普通 hole filling 不能修复封闭的隧道型贯穿孔。
+
+```bash
+python scripts/run_dpsr_iso_topology_sweep.py \
+  --source result/20260728/m2_mla_dmc_dpsr128_grid100 \
+  --output result/20260729/e0_m2_iso_topology_sweep
+```
+
+### E1：margin zero-level loss
+
+直接要求 DPSR 隐式场在 margin line 上取零：
+
+```text
+L_margin_zero = mean(abs(phi_pred(margin)))
+```
+
+这与 M2 的点锚定不同。M2 只要求预测点靠近 margin，E1 进一步要求最终 STL
+对应的等值面经过 margin。
+
+### E2：解剖细节监督
+
+用于减少过度平滑，包含：
+
+- `narrow-band loss`：重点监督目标零水平面附近。
+- `multi-scale grid loss`：同时监督整体形态和局部结构。
+- `grid-gradient loss`：保留隐式场的局部变化。
+- `sigma=1.0`：相对于基线 `sigma=2.0` 减少高斯模糊。
+
+只增加输出点数不等价于增加牙尖、窝沟和嵴的监督。
+
+### E3：软拓扑约束
+
+训练时将 PSR grid 下采样到 `32^3`，计算概率体素并匹配 GT 的软 Euler
+characteristic。它是无需额外依赖的可微拓扑代理损失；正式持续同调
+（persistent homology）损失仍作为后续替换方案。
+
+导出时仍必须执行硬性 QC：
+
+```text
+components = 1
+watertight = true
+genus = 0
+```
+
+### E4：组合实验
+
+组合 `margin-zero + narrow-band + multi-scale + grid-gradient + soft-topology`。
+组合权重只能依据训练集和验证集选择，测试集只用于最终报告。
+
+所有实验统一报告：
+
+- point/STL symmetric RMS、HD95、F-score；
+- normal cosine similarity 和 angular error；
+- margin point/STL RMS、HD95；
+- R1 point/STL RMS、HD95、F-score；
+- watertight、Euler characteristic、genus、topology failure rate；
+- 每个 test case 的 GT STL 和预测 STL。
+
+## 统一 10 病例 STL 对比集
+
 从 70 个 test 病例按 M0-M3 平均 STL symmetric RMS 排序，在 10 个等距排名位置选样，避免只展示效果好的病例：
 
 ```text

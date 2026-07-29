@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from .dpsr import sample_grid
+
 
 def sample_points(points: torch.Tensor, count: int) -> torch.Tensor:
     if points.shape[1] <= count:
@@ -68,6 +70,15 @@ def dmc_dpsr_loss(
     margin_risk_weight: float = 0.0,
     margin_risk_alpha: float = 3.0,
     margin_risk_sigma_mm: float = 1.0,
+    roi_half_extent_mm: float = 12.0,
+    margin_zero_weight: float = 0.0,
+    narrow_band_weight: float = 0.0,
+    narrow_band_width: float = 0.08,
+    multiscale_grid_weight: float = 0.0,
+    grid_gradient_weight: float = 0.0,
+    topology_weight: float = 0.0,
+    topology_resolution: int = 32,
+    topology_temperature: float = 0.05,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Jointly supervise DMC points and the reconstructed Poisson indicator."""
     point_loss, point_metrics = m0_loss(
@@ -80,9 +91,44 @@ def dmc_dpsr_loss(
     target_indicator = torch.tanh(target_grid)
     grid_mse = F.mse_loss(pred_indicator, target_indicator)
     grid_l1 = F.l1_loss(pred_indicator, target_indicator)
+    narrow_band = pred_points.new_tensor(0.0)
+    if narrow_band_weight > 0:
+        band = torch.exp(-target_indicator.abs() / max(narrow_band_width, 1e-6))
+        narrow_band = (
+            band * (pred_indicator - target_indicator).square()
+        ).sum() / band.sum().clamp_min(1.0)
+    multiscale_grid = pred_points.new_tensor(0.0)
+    if multiscale_grid_weight > 0:
+        for factor in (2, 4):
+            pred_coarse = F.avg_pool3d(
+                pred_indicator.unsqueeze(1), kernel_size=factor, stride=factor
+            )
+            target_coarse = F.avg_pool3d(
+                target_indicator.unsqueeze(1), kernel_size=factor, stride=factor
+            )
+            multiscale_grid = multiscale_grid + F.mse_loss(pred_coarse, target_coarse)
+    grid_gradient = pred_points.new_tensor(0.0)
+    if grid_gradient_weight > 0:
+        for dim in (1, 2, 3):
+            pred_diff = torch.diff(pred_indicator, dim=dim)
+            target_diff = torch.diff(target_indicator, dim=dim)
+            grid_gradient = grid_gradient + F.l1_loss(pred_diff, target_diff)
+    topology = pred_points.new_tensor(0.0)
+    if topology_weight > 0:
+        topology = soft_euler_topology_loss(
+            pred_grid,
+            target_grid,
+            resolution=topology_resolution,
+            temperature=topology_temperature,
+        )
     margin_anchor = pred_points.new_tensor(0.0)
     margin_risk = pred_points.new_tensor(0.0)
-    if margin is not None and (margin_anchor_weight > 0 or margin_risk_weight > 0):
+    margin_zero = pred_points.new_tensor(0.0)
+    if margin is not None and (
+        margin_anchor_weight > 0
+        or margin_risk_weight > 0
+        or margin_zero_weight > 0
+    ):
         margin_sample = sample_points(margin, 512)
         pred_sample = sample_points(pred_points, chamfer_points)
         target_sample = sample_points(target_points, chamfer_points)
@@ -117,11 +163,24 @@ def dmc_dpsr_loss(
                 (pred_min * pred_weights).sum(dim=1) / pred_weights.sum(dim=1)
                 + (target_min * target_weights).sum(dim=1) / target_weights.sum(dim=1)
             ).mean()
+        if margin_zero_weight > 0:
+            normalized_margin = (
+                margin_sample[..., :3] + roi_half_extent_mm
+            ) / (2.0 * roi_half_extent_mm)
+            margin_zero = sample_grid(
+                pred_grid,
+                normalized_margin.clamp(0.0, 1.0),
+            ).abs().mean()
     loss = (
         point_loss
         + grid_weight * grid_mse
         + margin_anchor_weight * margin_anchor
         + margin_risk_weight * margin_risk
+        + margin_zero_weight * margin_zero
+        + narrow_band_weight * narrow_band
+        + multiscale_grid_weight * multiscale_grid
+        + grid_gradient_weight * grid_gradient
+        + topology_weight * topology
     )
     return loss, {
         "loss": float(loss.detach().cpu()),
@@ -131,7 +190,109 @@ def dmc_dpsr_loss(
         "grid_l1": float(grid_l1.detach().cpu()),
         "margin_anchor": float(margin_anchor.detach().cpu()),
         "margin_risk": float(margin_risk.detach().cpu()),
+        "margin_zero": float(margin_zero.detach().cpu()),
+        "narrow_band": float(narrow_band.detach().cpu()),
+        "multiscale_grid": float(multiscale_grid.detach().cpu()),
+        "grid_gradient": float(grid_gradient.detach().cpu()),
+        "topology": float(topology.detach().cpu()),
     }
+
+
+def _soft_or(cells: list[torch.Tensor]) -> torch.Tensor:
+    complement = torch.ones_like(cells[0])
+    for cell in cells:
+        complement = complement * (1.0 - cell)
+    return 1.0 - complement
+
+
+def _pad_shift(
+    values: torch.Tensor,
+    *,
+    depth: int = 0,
+    height: int = 0,
+    width: int = 0,
+) -> torch.Tensor:
+    return F.pad(
+        values,
+        (
+            width,
+            1 - width,
+            height,
+            1 - height,
+            depth,
+            1 - depth,
+        ),
+    )
+
+
+def soft_euler_characteristic(occupancy: torch.Tensor) -> torch.Tensor:
+    """Differentiable Euler characteristic of a probabilistic voxel union."""
+    vertices = _soft_or(
+        [
+            _pad_shift(occupancy, depth=d, height=h, width=w)
+            for d in (0, 1)
+            for h in (0, 1)
+            for w in (0, 1)
+        ]
+    ).sum(dim=(1, 2, 3))
+
+    edges_d = _soft_or(
+        [
+            F.pad(occupancy, (w, 1 - w, h, 1 - h, 0, 0))
+            for h in (0, 1)
+            for w in (0, 1)
+        ]
+    ).sum(dim=(1, 2, 3))
+    edges_h = _soft_or(
+        [
+            F.pad(occupancy, (w, 1 - w, 0, 0, d, 1 - d))
+            for d in (0, 1)
+            for w in (0, 1)
+        ]
+    ).sum(dim=(1, 2, 3))
+    edges_w = _soft_or(
+        [
+            F.pad(occupancy, (0, 0, h, 1 - h, d, 1 - d))
+            for d in (0, 1)
+            for h in (0, 1)
+        ]
+    ).sum(dim=(1, 2, 3))
+
+    faces_d = _soft_or(
+        [F.pad(occupancy, (0, 0, 0, 0, d, 1 - d)) for d in (0, 1)]
+    ).sum(dim=(1, 2, 3))
+    faces_h = _soft_or(
+        [F.pad(occupancy, (0, 0, h, 1 - h, 0, 0)) for h in (0, 1)]
+    ).sum(dim=(1, 2, 3))
+    faces_w = _soft_or(
+        [F.pad(occupancy, (w, 1 - w, 0, 0, 0, 0)) for w in (0, 1)]
+    ).sum(dim=(1, 2, 3))
+
+    cubes = occupancy.sum(dim=(1, 2, 3))
+    return vertices - edges_d - edges_h - edges_w + faces_d + faces_h + faces_w - cubes
+
+
+def soft_euler_topology_loss(
+    pred_grid: torch.Tensor,
+    target_grid: torch.Tensor,
+    *,
+    resolution: int = 32,
+    temperature: float = 0.05,
+) -> torch.Tensor:
+    """Match target solid topology on a low-resolution differentiable grid."""
+    size = (resolution, resolution, resolution)
+    pred_small = F.interpolate(
+        pred_grid.unsqueeze(1), size=size, mode="trilinear", align_corners=True
+    )[:, 0]
+    target_small = F.interpolate(
+        target_grid.unsqueeze(1), size=size, mode="trilinear", align_corners=True
+    )[:, 0]
+    pred_occupancy = torch.sigmoid(pred_small / max(temperature, 1e-6))
+    target_occupancy = torch.sigmoid(target_small / max(temperature, 1e-6))
+    pred_euler = soft_euler_characteristic(pred_occupancy)
+    with torch.no_grad():
+        target_euler = soft_euler_characteristic(target_occupancy)
+    return (pred_euler - target_euler).square().mean()
 
 
 def sibling_repulsion_loss(offsets: torch.Tensor, min_distance: float) -> torch.Tensor:

@@ -81,6 +81,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--margin-risk-weight", type=float, default=0.5)
     parser.add_argument("--margin-risk-alpha", type=float, default=3.0)
     parser.add_argument("--margin-risk-sigma-mm", type=float, default=1.0)
+    parser.add_argument("--margin-zero-weight", type=float, default=0.0)
+    parser.add_argument("--narrow-band-weight", type=float, default=0.0)
+    parser.add_argument("--narrow-band-width", type=float, default=0.08)
+    parser.add_argument("--multiscale-grid-weight", type=float, default=0.0)
+    parser.add_argument("--grid-gradient-weight", type=float, default=0.0)
+    parser.add_argument("--topology-weight", type=float, default=0.0)
+    parser.add_argument("--topology-resolution", type=int, default=32)
+    parser.add_argument("--topology-temperature", type=float, default=0.05)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -193,6 +201,11 @@ def run_epoch(
             "grid_l1": 0.0,
             "margin_anchor": 0.0,
             "margin_risk": 0.0,
+            "margin_zero": 0.0,
+            "narrow_band": 0.0,
+            "multiscale_grid": 0.0,
+            "grid_gradient": 0.0,
+            "topology": 0.0,
         }
     elif args.decoder == "coarse_to_fine_tangent":
         sums = {
@@ -261,6 +274,15 @@ def run_epoch(
                     ),
                     margin_risk_alpha=args.margin_risk_alpha,
                     margin_risk_sigma_mm=args.margin_risk_sigma_mm,
+                    roi_half_extent_mm=args.roi_half_extent_mm,
+                    margin_zero_weight=args.margin_zero_weight,
+                    narrow_band_weight=args.narrow_band_weight,
+                    narrow_band_width=args.narrow_band_width,
+                    multiscale_grid_weight=args.multiscale_grid_weight,
+                    grid_gradient_weight=args.grid_gradient_weight,
+                    topology_weight=args.topology_weight,
+                    topology_resolution=args.topology_resolution,
+                    topology_temperature=args.topology_temperature,
                 )
             elif args.decoder == "coarse_to_fine_tangent":
                 outputs = model(
