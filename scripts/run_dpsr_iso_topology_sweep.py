@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.run_m0_official_experiment import (
+    curvature_detail_metrics,
     margin_distance_metrics,
     mesh_stats,
     read_mesh,
@@ -24,6 +25,7 @@ from scripts.run_m0_official_experiment import (
     regional_surface_metrics,
     restore_original_coordinates,
     sample_mesh_points,
+    sample_mesh_points_with_normals,
     surface_metrics,
 )
 
@@ -159,7 +161,8 @@ def main() -> None:
         shutil.copy2(gt_source, gt_copy)
         gt_mesh = read_mesh(gt_source)
         pred_surface = sample_mesh_points(pred_mesh, args.sample_points)
-        gt_surface = sample_mesh_points(gt_mesh, args.sample_points)
+        gt_surface_with_normals = sample_mesh_points_with_normals(gt_mesh, args.sample_points)
+        gt_surface = gt_surface_with_normals[:, :3]
         row = {
             "case": str(case_path),
             "stem": stem,
@@ -175,6 +178,12 @@ def main() -> None:
                 f"r1_stl_{k}": v
                 for k, v in regional_surface_metrics(
                     pred_surface, gt_surface, margin_original, radius_mm=1.0
+                ).items()
+            },
+            **{
+                f"stl_detail_{k}": v
+                for k, v in curvature_detail_metrics(
+                    pred_surface, gt_surface_with_normals
                 ).items()
             },
             **stats,
@@ -196,6 +205,9 @@ def main() -> None:
         "stl_fscore_0p3",
         "margin_stl_rms",
         "r1_stl_symmetric_rms",
+        "stl_detail_curvature_weighted_rms",
+        "stl_detail_high_curvature_gt_to_pred_rms",
+        "stl_detail_high_curvature_coverage_0p3",
     ):
         values = [float(row[key]) for row in ok if key in row and math.isfinite(float(row[key]))]
         if values:
