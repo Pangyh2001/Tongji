@@ -1161,3 +1161,40 @@ E2 虽然改善了整体 STL、颈缘和拓扑，但可视化仍显示牙尖偏�
 - DCrownFormer: <https://papers.miccai.org/miccai-2024/194-Paper0638.html>
 - SnowflakeNet: <https://openaccess.thecvf.com/content/ICCV2021/html/Xiang_SnowflakeNet_Point_Cloud_Completion_by_Snowflake_Point_Deconvolution_With_Skip-Transformer_ICCV_2021_paper.html>
 - PoinTr: <https://openaccess.thecvf.com/content/ICCV2021/html/Yu_PoinTr_Diverse_Point_Cloud_Completion_With_Geometry-Aware_Transformers_ICCV_2021_paper.html>
+
+### E5 实验结果
+
+下表均为 70 个固定 test 病例的 `balanced iso` STL 结果。旧 E2b 用新增的
+高曲率指标重新评估，保证采样和实现完全一致。
+
+| 实验 | STL RMS | F-score@0.3 | Margin RMS | R1 RMS | 曲率加权 RMS | 高曲率 RMS | 高曲率 coverage@0.3 | topology ok |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| E2b detail | 0.414 | 0.550 | 0.215 | 0.285 | 0.434 | 0.444 | 0.498 | 70/70 |
+| E5a CPL `lambda=0.5` | 0.403 | 0.565 | 0.227 | 0.358 | 0.424 | 0.431 | 0.529 | 70/70 |
+| **E5b CPL `lambda=1.0`** | **0.389** | **0.582** | **0.194** | **0.266** | **0.409** | **0.408** | **0.546** | **70/70** |
+| E5c CPL + 1024 queries | 0.405 | 0.553 | 0.209 | 0.286 | 0.425 | 0.427 | 0.517 | 69/70 |
+
+相对 E2b，E5b 的 STL RMS 下降约 6.0%，高曲率 RMS 下降约 8.1%，
+高曲率 coverage 提高 4.8 个百分点，同时 margin 和 R1 也有改善。
+
+可视化仍显示明显局限：
+
+- 大部分预测冠仍偏向平滑平均牙形，牙尖高度、中央窝、三角嵴和边缘嵴未充分恢复。
+- E5b 是统计意义上的改善，不是已达到技师设计质量；少数病例的高曲率覆盖率仍会退化。
+- E5c 证明直接把 256 个 query 插值为 1024 个并短时微调无效。后续应使用
+  SnowflakeNet 式渐进点分裂和 skip-transformer，或 DCrownFormer 式形态交叉注意力，
+  而不是继续机械增加 query 数。
+- 动态等值面可以保证网格拓扑，但不能创造点云没有预测出来的解剖细节。
+
+完整结果：
+
+```text
+result/20260801/README.md
+result/20260801/e5_anatomy_comparison.csv
+result/20260801/e5b_visual_comparison.png
+result/20260801/e5a_cpl_lambda05_iso_balanced/test/cases/
+result/20260801/e5b_cpl_lambda10_iso_balanced/test/cases/
+result/20260801/e5c_cpl_lambda10_q1024f4_iso_balanced/test/cases/
+```
+
+每个 `test/cases/<case>/` 都包含同一病例的 GT STL 和预测 STL。
