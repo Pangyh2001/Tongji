@@ -223,6 +223,7 @@ def evaluate_case(
 
         row.update(prefix_metrics("point", point_metrics(pred_local[:, :3], gt_local[:, :3])))
         row.update(point_normal_metrics(pred_local, gt_local))
+        row.update(prefix_metrics("point_detail", curvature_detail_metrics(pred_local, gt_local)))
         row.update(
             prefix_metrics(
                 "margin_point",
@@ -281,6 +282,13 @@ def evaluate_case(
         gt_surface = sample_mesh_points(gt_mesh, args.sample_points)
         stl_metrics = surface_metrics(pred_surface, gt_surface)
         row.update(prefix_metrics("stl", stl_metrics))
+        gt_surface_with_normals = sample_mesh_points_with_normals(gt_mesh, args.sample_points)
+        row.update(
+            prefix_metrics(
+                "stl_detail",
+                curvature_detail_metrics(pred_surface, gt_surface_with_normals),
+            )
+        )
         margin_original = restore_original_coordinates(
             np.pad(margin_local, ((0, 0), (0, 3))),
             case_path,
@@ -557,6 +565,16 @@ def sample_mesh_points(mesh: o3d.geometry.TriangleMesh, count: int) -> np.ndarra
     return np.asarray(pcd.points)
 
 
+def sample_mesh_points_with_normals(
+    mesh: o3d.geometry.TriangleMesh,
+    count: int,
+) -> np.ndarray:
+    pcd = mesh.sample_points_uniformly(number_of_points=count, use_triangle_normal=True)
+    xyz = np.asarray(pcd.points)
+    normals = np.asarray(pcd.normals)
+    return np.concatenate([xyz, normals], axis=1)
+
+
 def point_metrics(pred_xyz: np.ndarray, gt_xyz: np.ndarray) -> dict[str, float]:
     return surface_metrics(pred_xyz, gt_xyz)
 
@@ -605,6 +623,52 @@ def point_normal_metrics(
     return {
         "point_normal_cosine_similarity": float(np.mean(cosine)),
         "point_normal_angular_error_deg": float(np.degrees(np.arccos(cosine)).mean()),
+    }
+
+
+def curvature_detail_metrics(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    *,
+    sample_count: int = 4096,
+    neighbors: int = 16,
+    curvature_lambda: float = 1.0,
+) -> dict[str, float]:
+    if gt.shape[1] < 6:
+        return {
+            "curvature_weighted_rms": float("nan"),
+            "high_curvature_gt_to_pred_rms": float("nan"),
+            "high_curvature_coverage_0p3": float("nan"),
+        }
+    pred_step = max(1, len(pred) // sample_count)
+    gt_step = max(1, len(gt) // sample_count)
+    pred_sample = pred[::pred_step][:sample_count, :3].astype(np.float64)
+    gt_sample = gt[::gt_step][:sample_count].astype(np.float64)
+    gt_xyz = gt_sample[:, :3]
+    gt_normals = gt_sample[:, 3:6]
+    gt_normals /= np.maximum(np.linalg.norm(gt_normals, axis=1, keepdims=True), 1e-8)
+    tree = cKDTree(gt_xyz)
+    _, neighbor_index = tree.query(gt_xyz, k=min(neighbors + 1, len(gt_xyz)))
+    neighbor_normals = gt_normals[neighbor_index[:, 1:]]
+    cosine = np.clip(np.sum(gt_normals[:, None, :] * neighbor_normals, axis=2), -1.0, 1.0)
+    curvature = np.maximum(0.0, np.mean(1.0 - cosine, axis=1))
+    scale = max(float(np.percentile(curvature, 95)), 1e-8)
+    curvature = np.clip(curvature / scale, 0.0, 1.0)
+    weights = np.exp(curvature_lambda * curvature)
+
+    pred_to_gt, nearest_gt = tree.query(pred_sample, k=1)
+    gt_to_pred, _ = cKDTree(pred_sample).query(gt_xyz, k=1)
+    weighted_squared = np.concatenate(
+        [weights[nearest_gt] * pred_to_gt**2, weights * gt_to_pred**2]
+    )
+    combined_weights = np.concatenate([weights[nearest_gt], weights])
+    high = curvature >= np.percentile(curvature, 80)
+    return {
+        "curvature_weighted_rms": float(
+            np.sqrt(weighted_squared.sum() / np.maximum(combined_weights.sum(), 1e-8))
+        ),
+        "high_curvature_gt_to_pred_rms": rms(gt_to_pred[high]),
+        "high_curvature_coverage_0p3": float(np.mean(gt_to_pred[high] <= 0.3)),
     }
 
 
@@ -705,6 +769,9 @@ def summarize_rows(rows: list[dict]) -> dict[str, dict]:
         "point_recall_0p3",
         "point_normal_cosine_similarity",
         "point_normal_angular_error_deg",
+        "point_detail_curvature_weighted_rms",
+        "point_detail_high_curvature_gt_to_pred_rms",
+        "point_detail_high_curvature_coverage_0p3",
         "stl_pred_to_gt_rms",
         "stl_gt_to_pred_rms",
         "stl_symmetric_rms",
@@ -713,6 +780,9 @@ def summarize_rows(rows: list[dict]) -> dict[str, dict]:
         "stl_fscore_0p3",
         "stl_precision_0p3",
         "stl_recall_0p3",
+        "stl_detail_curvature_weighted_rms",
+        "stl_detail_high_curvature_gt_to_pred_rms",
+        "stl_detail_high_curvature_coverage_0p3",
         "margin_point_mean",
         "margin_point_rms",
         "margin_point_hd95",

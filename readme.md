@@ -1136,3 +1136,28 @@ result/20260729/e2b_m2_detail_iso_balanced/test/cases/
 ```
 
 每个 `test/cases/<case>/` 均保存对应病例的 GT STL 和预测 STL。
+
+## E5 解剖细节实验（2026-08-01）
+
+E2 虽然改善了整体 STL、颈缘和拓扑，但可视化仍显示牙尖偏低、窝沟和嵴被
+平均化。E5 依据 DCrownFormer 的 curvature-penalty loss，并参考局部结构化
+点云解码工作，验证曲率监督和更细粒度 query 是否能够恢复咬合面细节。
+
+实验分组：
+
+- E5a：E2 + curvature-penalty loss，`lambda=0.5`。
+- E5b：E2 + curvature-penalty loss，`lambda=1.0`。
+- E5c：E5b + `1024 queries x 4 x 4 points`；总输出仍为 16384 点。
+
+曲率使用 GT 点及其邻域法向变化估计，并按论文公式使用
+`exp(lambda * normalized_curvature)` 加权双向 squared Chamfer。新增指标：
+
+- curvature-weighted RMS；
+- 高曲率 GT 区域 RMS；
+- 高曲率区域 coverage@0.3 mm。
+
+参考文献：
+
+- DCrownFormer: <https://papers.miccai.org/miccai-2024/194-Paper0638.html>
+- SnowflakeNet: <https://openaccess.thecvf.com/content/ICCV2021/html/Xiang_SnowflakeNet_Point_Cloud_Completion_by_Snowflake_Point_Deconvolution_With_Skip-Transformer_ICCV_2021_paper.html>
+- PoinTr: <https://openaccess.thecvf.com/content/ICCV2021/html/Yu_PoinTr_Diverse_Point_Cloud_Completion_With_Geometry-Aware_Transformers_ICCV_2021_paper.html>

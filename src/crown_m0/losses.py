@@ -33,6 +33,53 @@ def normal_cosine_loss(
     return (1.0 - (pred_n * gathered).sum(dim=-1)).mean()
 
 
+def normal_variation_curvature(
+    xyz: torch.Tensor,
+    normals: torch.Tensor,
+    *,
+    neighbors: int = 16,
+) -> torch.Tensor:
+    """Estimate normalized local curvature from neighboring GT normals."""
+    normals = F.normalize(normals, dim=-1, eps=1e-6)
+    distances = torch.cdist(xyz, xyz)
+    count = min(neighbors + 1, xyz.shape[1])
+    indices = distances.topk(k=count, dim=-1, largest=False).indices[..., 1:]
+    batch = torch.arange(xyz.shape[0], device=xyz.device)[:, None, None]
+    nearby = normals[batch, indices]
+    cosine = (normals[:, :, None, :] * nearby).sum(dim=-1).clamp(-1.0, 1.0)
+    curvature = (1.0 - cosine).mean(dim=-1).clamp_min(0.0)
+    scale = torch.quantile(curvature.detach(), 0.95, dim=1, keepdim=True).clamp_min(1e-6)
+    return (curvature / scale).clamp(0.0, 1.0)
+
+
+def curvature_penalty_chamfer(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    points: int = 1024,
+    neighbors: int = 16,
+    curvature_lambda: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """DCrownFormer-style squared Chamfer weighted by GT curvature."""
+    pred_sample = sample_points(pred, points)
+    target_sample = sample_points(target, points)
+    pred_xyz = pred_sample[..., :3]
+    target_xyz = target_sample[..., :3]
+    target_curvature = normal_variation_curvature(
+        target_xyz,
+        target_sample[..., 3:6],
+        neighbors=neighbors,
+    )
+    target_weights = torch.exp(curvature_lambda * target_curvature)
+    squared = torch.cdist(pred_xyz, target_xyz).square()
+    pred_min, nearest_target = squared.min(dim=2)
+    target_min = squared.min(dim=1).values
+    pred_weights = torch.gather(target_weights, 1, nearest_target)
+    weighted = (pred_weights * pred_min).mean() + (target_weights * target_min).mean()
+    unweighted = pred_min.mean() + target_min.mean()
+    return weighted - unweighted, target_weights.mean()
+
+
 def m0_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -79,6 +126,10 @@ def dmc_dpsr_loss(
     topology_weight: float = 0.0,
     topology_resolution: int = 32,
     topology_temperature: float = 0.05,
+    curvature_penalty_weight: float = 0.0,
+    curvature_lambda: float = 1.0,
+    curvature_points: int = 1024,
+    curvature_neighbors: int = 16,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Jointly supervise DMC points and the reconstructed Poisson indicator."""
     point_loss, point_metrics = m0_loss(
@@ -120,6 +171,16 @@ def dmc_dpsr_loss(
             target_grid,
             resolution=topology_resolution,
             temperature=topology_temperature,
+        )
+    curvature_penalty = pred_points.new_tensor(0.0)
+    curvature_weight_mean = pred_points.new_tensor(1.0)
+    if curvature_penalty_weight > 0:
+        curvature_penalty, curvature_weight_mean = curvature_penalty_chamfer(
+            pred_points,
+            target_points,
+            points=curvature_points,
+            neighbors=curvature_neighbors,
+            curvature_lambda=curvature_lambda,
         )
     margin_anchor = pred_points.new_tensor(0.0)
     margin_risk = pred_points.new_tensor(0.0)
@@ -181,6 +242,7 @@ def dmc_dpsr_loss(
         + multiscale_grid_weight * multiscale_grid
         + grid_gradient_weight * grid_gradient
         + topology_weight * topology
+        + curvature_penalty_weight * curvature_penalty
     )
     return loss, {
         "loss": float(loss.detach().cpu()),
@@ -195,6 +257,8 @@ def dmc_dpsr_loss(
         "multiscale_grid": float(multiscale_grid.detach().cpu()),
         "grid_gradient": float(grid_gradient.detach().cpu()),
         "topology": float(topology.detach().cpu()),
+        "curvature_penalty": float(curvature_penalty.detach().cpu()),
+        "curvature_weight_mean": float(curvature_weight_mean.detach().cpu()),
     }
 
 

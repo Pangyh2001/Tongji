@@ -92,6 +92,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topology-weight", type=float, default=0.0)
     parser.add_argument("--topology-resolution", type=int, default=32)
     parser.add_argument("--topology-temperature", type=float, default=0.05)
+    parser.add_argument("--curvature-penalty-weight", type=float, default=0.0)
+    parser.add_argument("--curvature-lambda", type=float, default=1.0)
+    parser.add_argument("--curvature-points", type=int, default=1024)
+    parser.add_argument("--curvature-neighbors", type=int, default=16)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -140,8 +144,25 @@ def main() -> None:
             for key, value in checkpoint["model_state"].items()
             if not key.endswith("dpsr.omega") and not key.endswith("dpsr.gaussian")
         }
+        target_state = model.state_dict()
+        query_key = "query_embedding.weight"
+        if (
+            query_key in initial_state
+            and initial_state[query_key].shape != target_state[query_key].shape
+        ):
+            initial_state[query_key] = torch.nn.functional.interpolate(
+                initial_state[query_key].T.unsqueeze(0),
+                size=target_state[query_key].shape[0],
+                mode="linear",
+                align_corners=True,
+            )[0].T
+        if (
+            "folding_grid" in initial_state
+            and initial_state["folding_grid"].shape != target_state["folding_grid"].shape
+        ):
+            del initial_state["folding_grid"]
         missing, unexpected = model.load_state_dict(initial_state, strict=False)
-        allowed_missing = {"dpsr.omega", "dpsr.gaussian"}
+        allowed_missing = {"dpsr.omega", "dpsr.gaussian", "folding_grid"}
         if set(missing) - allowed_missing or unexpected:
             raise RuntimeError(
                 f"checkpoint mismatch: missing={missing}, unexpected={unexpected}"
@@ -227,6 +248,8 @@ def run_epoch(
             "multiscale_grid": 0.0,
             "grid_gradient": 0.0,
             "topology": 0.0,
+            "curvature_penalty": 0.0,
+            "curvature_weight_mean": 0.0,
         }
     elif args.decoder == "coarse_to_fine_tangent":
         sums = {
@@ -308,6 +331,10 @@ def run_epoch(
                     topology_weight=args.topology_weight,
                     topology_resolution=args.topology_resolution,
                     topology_temperature=args.topology_temperature,
+                    curvature_penalty_weight=args.curvature_penalty_weight,
+                    curvature_lambda=args.curvature_lambda,
+                    curvature_points=args.curvature_points,
+                    curvature_neighbors=args.curvature_neighbors,
                 )
             elif args.decoder == "coarse_to_fine_tangent":
                 outputs = model(
