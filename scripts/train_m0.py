@@ -78,6 +78,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dmc-queries", type=int, default=256)
     parser.add_argument("--dmc-fold-step", type=int, default=8)
     parser.add_argument("--dmc-transformer-layers", type=int, default=3)
+    parser.add_argument(
+        "--dmc-detail-decoder",
+        choices=["folding", "spd", "spd_skip"],
+        default="folding",
+    )
+    parser.add_argument("--dmc-spd-parent-step", type=int, default=4)
+    parser.add_argument("--dmc-spd-factor", type=int, default=4)
+    parser.add_argument("--dmc-spd-max-offset-mm", type=float, default=0.25)
+    parser.add_argument("--dmc-spd-neighbors", type=int, default=8)
     parser.add_argument("--margin-anchor-queries", type=int, default=64)
     parser.add_argument("--ring-groups", type=int, default=6)
     parser.add_argument("--margin-anchor-weight", type=float, default=0.5)
@@ -162,8 +171,11 @@ def main() -> None:
         ):
             del initial_state["folding_grid"]
         missing, unexpected = model.load_state_dict(initial_state, strict=False)
-        allowed_missing = {"dpsr.omega", "dpsr.gaussian", "folding_grid"}
-        if set(missing) - allowed_missing or unexpected:
+        allowed_missing = {"dpsr.omega", "dpsr.gaussian", "folding_grid", "spd_parent_grid"}
+        disallowed_missing = {
+            key for key in missing if key not in allowed_missing and not key.startswith("detail_upsampler.")
+        }
+        if disallowed_missing or unexpected:
             raise RuntimeError(
                 f"checkpoint mismatch: missing={missing}, unexpected={unexpected}"
             )
@@ -206,6 +218,11 @@ def build_model(args: argparse.Namespace) -> torch.nn.Module:
             use_margin=use_margin,
             margin_anchor_queries=args.margin_anchor_queries if use_anchor else 0,
             ring_groups=args.ring_groups if use_anchor else 0,
+            detail_decoder=args.dmc_detail_decoder,
+            spd_parent_step=args.dmc_spd_parent_step,
+            spd_factor=args.dmc_spd_factor,
+            spd_max_offset_mm=args.dmc_spd_max_offset_mm,
+            spd_neighbors=args.dmc_spd_neighbors,
         )
     if args.decoder == "coarse_to_fine_tangent":
         return M0TangentCoarseToFineNet(

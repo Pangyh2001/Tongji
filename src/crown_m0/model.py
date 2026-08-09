@@ -335,6 +335,103 @@ class M0TangentCoarseToFineNet(M0CoarseToFineNet):
         )
 
 
+class ProgressivePointSplitBlock(nn.Module):
+    """Split each parent into learned children with optional local input skip attention."""
+
+    def __init__(
+        self,
+        *,
+        model_dim: int,
+        factor: int = 4,
+        max_offset_mm: float = 0.25,
+        use_local_skip: bool = False,
+        skip_neighbors: int = 8,
+    ) -> None:
+        super().__init__()
+        self.factor = int(factor)
+        self.max_offset_mm = float(max_offset_mm)
+        self.use_local_skip = bool(use_local_skip)
+        self.skip_neighbors = int(skip_neighbors)
+        self.parent_position = nn.Linear(3, model_dim)
+        self.parent_normal = nn.Linear(3, model_dim)
+        self.child_codes = nn.Parameter(torch.randn(self.factor, model_dim) * 0.02)
+        if self.use_local_skip:
+            self.skip_norm = nn.LayerNorm(model_dim)
+            self.skip_attention = nn.MultiheadAttention(
+                model_dim,
+                num_heads=8,
+                dropout=0.1,
+                batch_first=True,
+            )
+            self.skip_gate = nn.Parameter(torch.tensor(-1.0))
+        self.refine = nn.Sequential(
+            nn.LayerNorm(model_dim),
+            nn.Linear(model_dim, model_dim * 2),
+            nn.GELU(),
+            nn.Linear(model_dim * 2, model_dim),
+        )
+        self.offset_head = nn.Linear(model_dim, 3)
+        self.normal_head = nn.Linear(model_dim, 3)
+
+    def _add_local_skip(
+        self,
+        parent_features: torch.Tensor,
+        parent_xyz: torch.Tensor,
+        memory_xyz: torch.Tensor,
+        memory: torch.Tensor,
+    ) -> torch.Tensor:
+        neighbor_count = min(self.skip_neighbors, memory.shape[1])
+        with torch.no_grad():
+            neighbor_index = torch.cdist(parent_xyz, memory_xyz).topk(
+                neighbor_count,
+                dim=-1,
+                largest=False,
+            ).indices
+        batch, parents, _ = parent_xyz.shape
+        memory_expanded = memory[:, None].expand(-1, parents, -1, -1)
+        neighbors = torch.gather(
+            memory_expanded,
+            2,
+            neighbor_index[..., None].expand(-1, -1, -1, memory.shape[-1]),
+        )
+        query = self.skip_norm(parent_features).reshape(batch * parents, 1, -1)
+        key_value = neighbors.reshape(batch * parents, neighbor_count, -1)
+        skip, _ = self.skip_attention(query, key_value, key_value, need_weights=False)
+        skip = skip.reshape(batch, parents, -1)
+        return parent_features + torch.sigmoid(self.skip_gate) * skip
+
+    def forward(
+        self,
+        parents: torch.Tensor,
+        parent_features: torch.Tensor,
+        *,
+        memory_xyz: torch.Tensor,
+        memory: torch.Tensor,
+    ) -> torch.Tensor:
+        parent_xyz = parents[..., :3]
+        parent_normals = torch.nn.functional.normalize(
+            parents[..., 3:6], dim=-1, eps=1e-6
+        )
+        features = (
+            parent_features
+            + self.parent_position(parent_xyz)
+            + self.parent_normal(parent_normals)
+        )
+        if self.use_local_skip:
+            features = self._add_local_skip(features, parent_xyz, memory_xyz, memory)
+        children = features.unsqueeze(2) + self.child_codes[None, None]
+        children = children + self.refine(children)
+        offsets = torch.tanh(self.offset_head(children)) * self.max_offset_mm
+        xyz = parent_xyz.unsqueeze(2) + offsets
+        normal_delta = 0.2 * torch.tanh(self.normal_head(children))
+        normals = torch.nn.functional.normalize(
+            parent_normals.unsqueeze(2) + normal_delta,
+            dim=-1,
+            eps=1e-6,
+        )
+        return torch.cat([xyz, normals], dim=-1).flatten(1, 2)
+
+
 class M0DMCDPSRNet(nn.Module):
     """DMC-style Transformer + Folding decoder with differentiable PSR."""
 
@@ -355,6 +452,11 @@ class M0DMCDPSRNet(nn.Module):
         margin_anchor_queries: int = 0,
         ring_groups: int = 0,
         margin_anchor_max_offset_mm: float = 1.5,
+        detail_decoder: str = "folding",
+        spd_parent_step: int = 4,
+        spd_factor: int = 4,
+        spd_max_offset_mm: float = 0.25,
+        spd_neighbors: int = 8,
     ) -> None:
         super().__init__()
         self.context_tokens_per_input = context_tokens_per_input
@@ -368,10 +470,19 @@ class M0DMCDPSRNet(nn.Module):
         self.margin_anchor_queries = int(margin_anchor_queries)
         self.ring_groups = int(ring_groups)
         self.margin_anchor_max_offset_mm = float(margin_anchor_max_offset_mm)
+        self.detail_decoder = detail_decoder
         if self.margin_anchor_queries > self.num_queries:
             raise ValueError("margin_anchor_queries cannot exceed num_queries")
         if self.margin_anchor_queries and not self.use_margin:
             raise ValueError("margin-anchored queries require use_margin=True")
+        if detail_decoder not in {"folding", "spd", "spd_skip"}:
+            raise ValueError(f"unsupported detail decoder: {detail_decoder}")
+        if detail_decoder != "folding" and (
+            spd_parent_step * spd_parent_step * spd_factor != self.patch_points
+        ):
+            raise ValueError(
+                "spd_parent_step^2 * spd_factor must equal fold_step^2"
+            )
 
         self.point_projection = nn.Sequential(
             nn.Linear(6, 128),
@@ -448,6 +559,20 @@ class M0DMCDPSRNet(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv1d(128, 3, 1),
         )
+        if detail_decoder != "folding":
+            parent_axis = torch.linspace(-1.0, 1.0, steps=spd_parent_step)
+            parent_u, parent_v = torch.meshgrid(parent_axis, parent_axis, indexing="ij")
+            self.register_buffer(
+                "spd_parent_grid",
+                torch.stack([parent_u.flatten(), parent_v.flatten()], dim=0),
+            )
+            self.detail_upsampler = ProgressivePointSplitBlock(
+                model_dim=model_dim,
+                factor=spd_factor,
+                max_offset_mm=spd_max_offset_mm,
+                use_local_skip=detail_decoder == "spd_skip",
+                skip_neighbors=spd_neighbors,
+            )
         self.dpsr = DPSR(resolution=dpsr_resolution, sigma=dpsr_sigma)
 
     def _sample_context(self, points: torch.Tensor) -> torch.Tensor:
@@ -547,23 +672,45 @@ class M0DMCDPSRNet(nn.Module):
             )
 
         batch, queries_count, channels = query_features.shape
-        features = query_features.reshape(batch * queries_count, channels, 1).expand(
-            -1,
-            -1,
-            self.patch_points,
+        patch_points = (
+            self.patch_points
+            if self.detail_decoder == "folding"
+            else self.spd_parent_grid.shape[1]
         )
-        grid = self.folding_grid[None].expand(batch * queries_count, -1, -1)
+        features = query_features.reshape(batch * queries_count, channels, 1).expand(
+            -1, -1, patch_points
+        )
+        detail_grid = (
+            self.folding_grid
+            if self.detail_decoder == "folding"
+            else self.spd_parent_grid
+        )
+        grid = detail_grid[None].expand(batch * queries_count, -1, -1)
         folded_1 = self.folding_1(torch.cat([features, grid], dim=1))
         folded_2 = self.folding_2(torch.cat([features, folded_1], dim=1))
-        relative = folded_2.transpose(1, 2).reshape(batch, queries_count, self.patch_points, 3)
+        relative = folded_2.transpose(1, 2).reshape(
+            batch, queries_count, patch_points, 3
+        )
         xyz_raw = coarse.unsqueeze(2) + relative
         xyz = torch.tanh(xyz_raw / self.roi_half_extent_mm) * self.roi_half_extent_mm
 
         normal_input = torch.cat([features, folded_2], dim=1)
         normals = self.normal_head(normal_input).transpose(1, 2)
-        normals = normals.reshape(batch, queries_count, self.patch_points, 3)
+        normals = normals.reshape(batch, queries_count, patch_points, 3)
         normals = torch.nn.functional.normalize(normals, dim=-1, eps=1e-6)
-        points = torch.cat([xyz, normals], dim=-1).flatten(1, 2)
+        parents = torch.cat([xyz, normals], dim=-1).flatten(1, 2)
+        if self.detail_decoder == "folding":
+            points = parents
+        else:
+            parent_features = query_features.unsqueeze(2).expand(
+                -1, -1, patch_points, -1
+            ).flatten(1, 2)
+            points = self.detail_upsampler(
+                parents,
+                parent_features,
+                memory_xyz=context_points[..., :3],
+                memory=memory,
+            )
         if return_grid:
             return {"points": points, "psr_grid": self.points_to_grid(points)}
         return points

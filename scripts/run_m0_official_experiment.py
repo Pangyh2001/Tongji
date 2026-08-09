@@ -119,6 +119,13 @@ def load_model(args: argparse.Namespace) -> torch.nn.Module:
                 int(checkpoint_args.get("margin_anchor_queries", 64)) if use_anchor else 0
             ),
             ring_groups=int(checkpoint_args.get("ring_groups", 6)) if use_anchor else 0,
+            detail_decoder=str(checkpoint_args.get("dmc_detail_decoder", "folding")),
+            spd_parent_step=int(checkpoint_args.get("dmc_spd_parent_step", 4)),
+            spd_factor=int(checkpoint_args.get("dmc_spd_factor", 4)),
+            spd_max_offset_mm=float(
+                checkpoint_args.get("dmc_spd_max_offset_mm", 0.25)
+            ),
+            spd_neighbors=int(checkpoint_args.get("dmc_spd_neighbors", 8)),
         ).to(args.device)
     elif decoder == "coarse_to_fine_tangent":
         model = M0TangentCoarseToFineNet(
